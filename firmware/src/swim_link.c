@@ -1,5 +1,6 @@
 #include "swim_link.h"
 
+#include "hardware/sync.h"
 #include "swim_phy.h"
 #include "pico/stdlib.h"
 
@@ -38,34 +39,24 @@ static rpsw_status_t send_command(uint8_t command) {
     if (!swim_phy_timing_ready()) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
-    if (!swim_phy_write_bit(false) ||
-        !swim_phy_write_bit((command & 0x4u) != 0u) ||
-        !swim_phy_write_bit((command & 0x2u) != 0u) ||
-        !swim_phy_write_bit((command & 0x1u) != 0u) ||
-        !swim_phy_write_bit(parity3(command))) {
+    uint32_t frame = ((uint32_t)(command & 0x7u) << 1u) | (parity3(command) ? 1u : 0u);
+    bool ack = false;
+    if (!swim_phy_write_frame_bits_read_ack(frame, 5, SWIM_ACK_TIMEOUT_US, &ack)) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
-    swim_phy_release();
-    return read_ack();
+    return ack ? RPSW_OK : RPSW_ERR_SWIM_NACK;
 }
 
 static rpsw_status_t send_byte(uint8_t byte) {
     if (!swim_phy_timing_ready()) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
-    if (!swim_phy_write_bit(false)) {
+    uint32_t frame = ((uint32_t)byte << 1u) | (parity8(byte) ? 1u : 0u);
+    bool ack = false;
+    if (!swim_phy_write_frame_bits_read_ack(frame, 10, SWIM_ACK_TIMEOUT_US, &ack)) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
-    for (int bit = 7; bit >= 0; bit--) {
-        if (!swim_phy_write_bit(((byte >> bit) & 1u) != 0u)) {
-            return RPSW_ERR_SWIM_TIMEOUT;
-        }
-    }
-    if (!swim_phy_write_bit(parity8(byte))) {
-        return RPSW_ERR_SWIM_TIMEOUT;
-    }
-    swim_phy_release();
-    return read_ack();
+    return ack ? RPSW_OK : RPSW_ERR_SWIM_NACK;
 }
 
 static rpsw_status_t recv_byte(uint8_t *byte) {
@@ -92,11 +83,11 @@ static rpsw_status_t recv_byte(uint8_t *byte) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
     if (parity != parity8(value)) {
-        (void)swim_phy_write_bit(false);
+        (void)swim_phy_write_frame_bits(0u, 1);
         return RPSW_ERR_TARGET;
     }
 
-    if (!swim_phy_write_bit(true)) {
+    if (!swim_phy_write_frame_bits(1u, 1)) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
     *byte = value;
@@ -115,39 +106,19 @@ rpsw_status_t swim_link_enter(void) {
     swim_phy_set_enter_stage(SWIM_ENTER_STAGE_RESET_ASSERTED);
     sleep_ms(2);
 
-    rpsw_status_t st = swim_phy_entry_sequence_um0470();
-    if (st != RPSW_OK) {
+    if (!swim_phy_entry_sequence_um0470_wait_sync(SWIM_SYNC_TIMEOUT_US)) {
         swim_phy_mark_enter_fail();
         swim_phy_release();
         swim_phy_nrst_release();
-        return st;
+        return RPSW_ERR_SWIM_TIMEOUT;
     }
     swim_phy_set_enter_stage(SWIM_ENTER_STAGE_ENTRY_SENT);
-
-    if (!swim_phy_wait_sync(SWIM_SYNC_TIMEOUT_US)) {
-        swim_phy_mark_enter_fail();
-        swim_phy_release();
-        swim_phy_nrst_release();
-        return RPSW_ERR_SWIM_TIMEOUT;
-    }
     swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SYNC1_OK);
-
-    swim_phy_comm_reset();
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_COMM_RESET_SENT);
-
-    if (!swim_phy_wait_sync(SWIM_SYNC_TIMEOUT_US)) {
-        swim_phy_mark_enter_fail();
-        swim_phy_release();
-        swim_phy_nrst_release();
-        return RPSW_ERR_SWIM_TIMEOUT;
-    }
-    swim_phy_mark_second_sync_seen();
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SYNC2_OK);
 
     uint8_t csr = SWIM_CSR_INIT_VALUE;
 
     swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_WRITE_START);
-    st = swim_link_write(SWIM_CSR_ADDR, &csr, 1);
+    rpsw_status_t st = swim_link_write(SWIM_CSR_ADDR, &csr, 1);
     if (st != RPSW_OK) {
         swim_phy_mark_enter_fail();
         swim_phy_release();
@@ -186,49 +157,58 @@ rpsw_status_t swim_link_enter(void) {
 }
 
 rpsw_status_t swim_link_srst(void) {
-    return send_command(SWIM_CMD_SRST);
+    uint32_t irq_state = save_and_disable_interrupts();
+    rpsw_status_t st = send_command(SWIM_CMD_SRST);
+    restore_interrupts(irq_state);
+    return st;
 }
 
 rpsw_status_t swim_link_read(uint32_t address, uint8_t *data, size_t len) {
     if (len == 0 || len > 255u) {
         return RPSW_ERR_BAD_ARGUMENT;
     }
+    uint32_t irq_state = save_and_disable_interrupts();
     rpsw_status_t st = send_command(SWIM_CMD_ROTF);
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)len);
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)((address >> 16) & 0xffu));
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)((address >> 8) & 0xffu));
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)(address & 0xffu));
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
 
     for (size_t i = 0; i < len; i++) {
         st = recv_byte(&data[i]);
-        if (st != RPSW_OK) return st;
+        if (st != RPSW_OK) goto out;
     }
-    return RPSW_OK;
+out:
+    restore_interrupts(irq_state);
+    return st;
 }
 
 rpsw_status_t swim_link_write(uint32_t address, const uint8_t *data, size_t len) {
     if (len == 0 || len > 255u) {
         return RPSW_ERR_BAD_ARGUMENT;
     }
+    uint32_t irq_state = save_and_disable_interrupts();
     rpsw_status_t st = send_command(SWIM_CMD_WOTF);
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)len);
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)((address >> 16) & 0xffu));
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)((address >> 8) & 0xffu));
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
     st = send_byte((uint8_t)(address & 0xffu));
-    if (st != RPSW_OK) return st;
+    if (st != RPSW_OK) goto out;
 
     for (size_t i = 0; i < len; i++) {
         st = send_byte(data[i]);
-        if (st != RPSW_OK) return st;
+        if (st != RPSW_OK) goto out;
     }
-    return RPSW_OK;
+out:
+    restore_interrupts(irq_state);
+    return st;
 }

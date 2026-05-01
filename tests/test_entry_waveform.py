@@ -69,6 +69,13 @@ def test_um0470_entry_protocol_duration_excludes_settle_segments() -> None:
     assert protocol_duration_us(um0470_entry_segments()) == ENTRY_PROTOCOL_US
 
 
+def test_real_entry_path_skips_debug_end_settle_for_fast_sync() -> None:
+    source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
+    assert "return emit_entry_segments(entry_segment_count() - 1u);" in source
+    assert "void swim_phy_entry_waveform(void)" in source
+    assert "(void)emit_entry_segments(entry_segment_count());" in source
+
+
 def test_entry_waveform_command_exists() -> None:
     parser = build_parser()
     args = parser.parse_args(["entry-waveform", "--port", "/dev/null", "--delay-ms", "1"])

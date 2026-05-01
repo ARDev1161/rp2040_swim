@@ -7,6 +7,8 @@
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
+#include "hardware/sync.h"
+#include "hardware/structs/sio.h"
 #include "pico/stdlib.h"
 #include "swim_waveform.pio.h"
 
@@ -57,6 +59,15 @@ static void pio_release_swim_pin(void) {
     uint32_t mask = 1u << g_pio.swim_pin;
     pio_sm_set_pins_with_mask(g_pio.pio, g_pio.sm, 0u, mask);
     pio_sm_set_pindirs_with_mask(g_pio.pio, g_pio.sm, 0u, mask);
+}
+
+static inline bool sample_swim_pin_fast(void) {
+    return (sio_hw->gpio_in & (1u << g_pio.swim_pin)) != 0u;
+}
+
+static void set_pio_tick_hz(uint32_t tick_hz) {
+    float div = (float)clock_get_hz(clk_sys) / (float)tick_hz;
+    pio_sm_set_clkdiv(g_pio.pio, g_pio.sm, div);
 }
 
 static bool try_claim_pio(PIO pio) {
@@ -133,6 +144,7 @@ rpsw_status_t swim_pio_waveform_init(uint swim_pin, bool enable_internal_pullup)
     float div = (float)clock_get_hz(clk_sys) / (float)(SWIM_PIO_TICKS_PER_US * 1000000u);
     sm_config_set_clkdiv(&config, div);
     pio_sm_init(g_pio.pio, g_pio.sm, g_pio.offset, &config);
+    set_pio_tick_hz(SWIM_PIO_TICKS_PER_US * 1000000u);
     pio_release_swim_pin();
     pio_sm_set_enabled(g_pio.pio, g_pio.sm, true);
     set_error("ok");
@@ -178,6 +190,33 @@ static rpsw_status_t encode_segments(const swim_segment_t *segments, size_t coun
     return RPSW_OK;
 }
 
+static rpsw_status_t encode_tick_segments(const swim_pio_tick_segment_t *segments, size_t count,
+                                          uint32_t *commands, uint32_t *total_ticks) {
+    if (segments == NULL || commands == NULL || total_ticks == NULL || count == 0 ||
+        count > SWIM_PIO_MAX_SEGMENTS) {
+        return RPSW_ERR_BAD_ARGUMENT;
+    }
+
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (segments[i].level != SWIM_SEG_RELEASE && segments[i].level != SWIM_SEG_LOW) {
+            return RPSW_ERR_BAD_ARGUMENT;
+        }
+        if (segments[i].duration_ticks <= SWIM_PIO_SEGMENT_OVERHEAD_TICKS ||
+            segments[i].duration_ticks > 0x7ffffffful) {
+            return RPSW_ERR_BAD_ARGUMENT;
+        }
+        uint32_t adjusted = segments[i].duration_ticks - SWIM_PIO_SEGMENT_OVERHEAD_TICKS;
+        commands[i] = (adjusted << 1) | (uint32_t)segments[i].level;
+        total += segments[i].duration_ticks;
+    }
+    if (total > UINT32_MAX) {
+        return RPSW_ERR_BAD_ARGUMENT;
+    }
+    *total_ticks = (uint32_t)total;
+    return RPSW_OK;
+}
+
 rpsw_status_t swim_pio_emit_segments(const swim_segment_t *segments, size_t count) {
     if (!g_pio.initialized) {
         set_error("PIO waveform engine not initialized");
@@ -198,6 +237,7 @@ rpsw_status_t swim_pio_emit_segments(const swim_segment_t *segments, size_t coun
     pio_sm_restart(g_pio.pio, g_pio.sm);
     pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
     pio_gpio_init(g_pio.pio, g_pio.swim_pin);
+    set_pio_tick_hz(SWIM_PIO_TICKS_PER_US * 1000000u);
     pio_release_swim_pin();
 
     dma_channel_config dma_config = dma_channel_get_default_config(g_pio.dma_channel);
@@ -209,11 +249,16 @@ rpsw_status_t swim_pio_emit_segments(const swim_segment_t *segments, size_t coun
                           &g_pio.pio->txf[g_pio.sm], commands, count + 1u, false);
 
     dma_channel_start(g_pio.dma_channel);
+    absolute_time_t waveform_done = make_timeout_time_us(total_us);
     pio_sm_set_enabled(g_pio.pio, g_pio.sm, true);
     dma_channel_wait_for_finish_blocking(g_pio.dma_channel);
 
     absolute_time_t deadline = make_timeout_time_us(total_us + 1000u);
     while (!pio_interrupt_get(g_pio.pio, SWIM_PIO_COMPLETION_IRQ)) {
+        if (absolute_time_diff_us(get_absolute_time(), waveform_done) <= 0 &&
+            pio_sm_is_tx_fifo_empty(g_pio.pio, g_pio.sm)) {
+            break;
+        }
         if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
             pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
             pio_release_swim_pin();
@@ -226,7 +271,266 @@ rpsw_status_t swim_pio_emit_segments(const swim_segment_t *segments, size_t coun
     pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
     pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
     pio_release_swim_pin();
-    release_pin(g_pio.swim_pin, g_pio.internal_pullup);
+    /*
+     * Do not call gpio_init()/pull reconfiguration here. Real STM8 targets can
+     * begin the synchronization low pulse only about 30 us after the final
+     * entry release; the pad is already high-Z under PIO ownership and gpio_get
+     * can sample the input level directly. Later SWIM bit operations explicitly
+     * switch the pin back to SIO before driving.
+     */
+    set_error("ok");
+    return RPSW_OK;
+}
+
+rpsw_status_t swim_pio_emit_tick_segments(const swim_pio_tick_segment_t *segments, size_t count,
+                                          uint32_t tick_hz) {
+    if (!g_pio.initialized || tick_hz == 0) {
+        set_error("PIO waveform engine not initialized");
+        return RPSW_ERR_INTERNAL;
+    }
+
+    uint32_t commands[SWIM_PIO_MAX_SEGMENTS + 1u];
+    uint32_t total_ticks = 0;
+    rpsw_status_t st = encode_tick_segments(segments, count, commands, &total_ticks);
+    if (st != RPSW_OK) {
+        set_error("bad waveform tick segment list");
+        return st;
+    }
+    commands[count] = 0u;
+
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_sm_clear_fifos(g_pio.pio, g_pio.sm);
+    pio_sm_restart(g_pio.pio, g_pio.sm);
+    pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+    pio_gpio_init(g_pio.pio, g_pio.swim_pin);
+    set_pio_tick_hz(tick_hz);
+    pio_release_swim_pin();
+
+    dma_channel_config dma_config = dma_channel_get_default_config(g_pio.dma_channel);
+    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
+    channel_config_set_read_increment(&dma_config, true);
+    channel_config_set_write_increment(&dma_config, false);
+    channel_config_set_dreq(&dma_config, pio_get_dreq(g_pio.pio, g_pio.sm, true));
+    dma_channel_configure(g_pio.dma_channel, &dma_config,
+                          &g_pio.pio->txf[g_pio.sm], commands, count + 1u, false);
+
+    uint64_t timeout_us64 = ((uint64_t)total_ticks * 1000000ull + tick_hz - 1u) / tick_hz + 1000u;
+    dma_channel_start(g_pio.dma_channel);
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, true);
+    dma_channel_wait_for_finish_blocking(g_pio.dma_channel);
+
+    absolute_time_t deadline = make_timeout_time_us((uint32_t)timeout_us64);
+    while (!pio_interrupt_get(g_pio.pio, SWIM_PIO_COMPLETION_IRQ)) {
+        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+            pio_release_swim_pin();
+            set_error("PIO tick waveform timeout");
+            return RPSW_ERR_SWIM_TIMEOUT;
+        }
+        tight_loop_contents();
+    }
+
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+    pio_release_swim_pin();
+    set_error("ok");
+    return RPSW_OK;
+}
+
+rpsw_status_t swim_pio_emit_tick_segments_wait_response(const swim_pio_tick_segment_t *segments,
+                                                        size_t count, uint32_t tick_hz,
+                                                        uint32_t timeout_us,
+                                                        swim_pio_sync_measurement_t *measurement) {
+    if (!g_pio.initialized || tick_hz == 0 || measurement == NULL) {
+        set_error("PIO waveform engine not initialized");
+        return RPSW_ERR_INTERNAL;
+    }
+
+    uint32_t commands[SWIM_PIO_MAX_SEGMENTS + 1u];
+    uint32_t total_ticks = 0;
+    rpsw_status_t st = encode_tick_segments(segments, count, commands, &total_ticks);
+    if (st != RPSW_OK) {
+        set_error("bad waveform tick segment list");
+        return st;
+    }
+    commands[count] = 0u;
+    measurement->low_us = 0;
+    measurement->low_ns = 0;
+    measurement->low_loop_count = 0;
+
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_sm_clear_fifos(g_pio.pio, g_pio.sm);
+    pio_sm_restart(g_pio.pio, g_pio.sm);
+    pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+    pio_gpio_init(g_pio.pio, g_pio.swim_pin);
+    set_pio_tick_hz(tick_hz);
+    pio_release_swim_pin();
+
+    dma_channel_config dma_config = dma_channel_get_default_config(g_pio.dma_channel);
+    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
+    channel_config_set_read_increment(&dma_config, true);
+    channel_config_set_write_increment(&dma_config, false);
+    channel_config_set_dreq(&dma_config, pio_get_dreq(g_pio.pio, g_pio.sm, true));
+    dma_channel_configure(g_pio.dma_channel, &dma_config,
+                          &g_pio.pio->txf[g_pio.sm], commands, count + 1u, false);
+
+    uint64_t frame_timeout_us = ((uint64_t)total_ticks * 1000000ull + tick_hz - 1u) / tick_hz + 1000u;
+    dma_channel_start(g_pio.dma_channel);
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, true);
+    dma_channel_wait_for_finish_blocking(g_pio.dma_channel);
+
+    absolute_time_t frame_deadline = make_timeout_time_us((uint32_t)frame_timeout_us);
+    while (!pio_interrupt_get(g_pio.pio, SWIM_PIO_COMPLETION_IRQ)) {
+        if (absolute_time_diff_us(get_absolute_time(), frame_deadline) <= 0) {
+            pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+            pio_release_swim_pin();
+            set_error("PIO tick waveform timeout");
+            return RPSW_ERR_SWIM_TIMEOUT;
+        }
+        tight_loop_contents();
+    }
+
+    uint32_t irq_state = save_and_disable_interrupts();
+    absolute_time_t response_deadline = make_timeout_time_us(timeout_us);
+    while (sample_swim_pin_fast()) {
+        if (absolute_time_diff_us(get_absolute_time(), response_deadline) <= 0) {
+            restore_interrupts(irq_state);
+            pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+            pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+            pio_release_swim_pin();
+            set_error("response timeout high");
+            return RPSW_ERR_SWIM_TIMEOUT;
+        }
+        tight_loop_contents();
+    }
+
+    uint64_t start_us = time_us_64();
+    uint32_t low_count = 0;
+    while (!sample_swim_pin_fast()) {
+        low_count++;
+        tight_loop_contents();
+        if (absolute_time_diff_us(get_absolute_time(), response_deadline) <= 0) {
+            restore_interrupts(irq_state);
+            pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+            pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+            pio_release_swim_pin();
+            set_error("response timeout low");
+            return RPSW_ERR_SWIM_TIMEOUT;
+        }
+    }
+
+    uint64_t elapsed_us64 = time_us_64() - start_us;
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+    pio_release_swim_pin();
+    restore_interrupts(irq_state);
+
+    measurement->low_us = elapsed_us64 > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_us64;
+    measurement->low_ns = measurement->low_us * 1000u;
+    measurement->low_loop_count = low_count;
+    set_error("ok");
+    return low_count == 0 ? RPSW_ERR_SWIM_TIMEOUT : RPSW_OK;
+}
+
+rpsw_status_t swim_pio_emit_segments_wait_sync(const swim_segment_t *segments, size_t count,
+                                               uint32_t timeout_us,
+                                               swim_pio_sync_measurement_t *measurement) {
+    if (!g_pio.initialized || measurement == NULL) {
+        set_error("PIO waveform engine not initialized");
+        return RPSW_ERR_INTERNAL;
+    }
+
+    uint32_t commands[SWIM_PIO_MAX_SEGMENTS + 1u];
+    uint32_t total_us = 0;
+    rpsw_status_t st = encode_segments(segments, count, commands, &total_us);
+    if (st != RPSW_OK) {
+        set_error("bad waveform segment list");
+        return st;
+    }
+    commands[count] = 0u;
+    measurement->low_us = 0;
+    measurement->low_ns = 0;
+    measurement->low_loop_count = 0;
+
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_sm_clear_fifos(g_pio.pio, g_pio.sm);
+    pio_sm_restart(g_pio.pio, g_pio.sm);
+    pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+    pio_gpio_init(g_pio.pio, g_pio.swim_pin);
+    pio_release_swim_pin();
+
+    dma_channel_config dma_config = dma_channel_get_default_config(g_pio.dma_channel);
+    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
+    channel_config_set_read_increment(&dma_config, true);
+    channel_config_set_write_increment(&dma_config, false);
+    channel_config_set_dreq(&dma_config, pio_get_dreq(g_pio.pio, g_pio.sm, true));
+    dma_channel_configure(g_pio.dma_channel, &dma_config,
+                          &g_pio.pio->txf[g_pio.sm], commands, count + 1u, false);
+
+    dma_channel_start(g_pio.dma_channel);
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, true);
+
+    absolute_time_t waveform_deadline = make_timeout_time_us(total_us + 1000u);
+    while (!pio_interrupt_get(g_pio.pio, SWIM_PIO_COMPLETION_IRQ)) {
+        if (absolute_time_diff_us(get_absolute_time(), waveform_deadline) <= 0) {
+            pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+            pio_release_swim_pin();
+            set_error("PIO waveform timeout");
+            return RPSW_ERR_SWIM_TIMEOUT;
+        }
+        tight_loop_contents();
+    }
+
+    uint32_t irq_state = save_and_disable_interrupts();
+    absolute_time_t sync_deadline = make_timeout_time_us(timeout_us);
+    while (sample_swim_pin_fast()) {
+        if (absolute_time_diff_us(get_absolute_time(), sync_deadline) <= 0) {
+            restore_interrupts(irq_state);
+            pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+            pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+            pio_release_swim_pin();
+            set_error("sync timeout high");
+            return RPSW_ERR_SWIM_TIMEOUT;
+        }
+        tight_loop_contents();
+    }
+
+    uint64_t start_us = time_us_64();
+    uint32_t low_count = 0;
+    while (!sample_swim_pin_fast()) {
+        low_count++;
+        tight_loop_contents();
+        if (absolute_time_diff_us(get_absolute_time(), sync_deadline) <= 0) {
+            restore_interrupts(irq_state);
+            pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+            pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+            pio_release_swim_pin();
+            set_error("sync timeout low");
+            return RPSW_ERR_SWIM_TIMEOUT;
+        }
+    }
+
+    uint64_t elapsed_us64 = time_us_64() - start_us;
+    if (elapsed_us64 == 0 || elapsed_us64 > UINT32_MAX || low_count == 0) {
+        restore_interrupts(irq_state);
+        pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+        pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+        pio_release_swim_pin();
+        set_error("bad sync measurement");
+        return RPSW_ERR_SWIM_TIMEOUT;
+    }
+
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_interrupt_clear(g_pio.pio, SWIM_PIO_COMPLETION_IRQ);
+    pio_release_swim_pin();
+    if (dma_channel_is_busy(g_pio.dma_channel)) {
+        dma_channel_abort(g_pio.dma_channel);
+    }
+
+    measurement->low_us = (uint32_t)elapsed_us64;
+    measurement->low_ns = measurement->low_us * 1000u;
+    measurement->low_loop_count = low_count;
+    restore_interrupts(irq_state);
     set_error("ok");
     return RPSW_OK;
 }

@@ -68,9 +68,14 @@ void swim_phy_nrst_assert(void);
 void swim_phy_nrst_release(void);
 void swim_phy_delay_us(uint32_t us);
 rpsw_status_t swim_phy_entry_sequence_um0470(void);
+bool swim_phy_entry_sequence_um0470_wait_sync(uint32_t timeout_us);
 void swim_phy_entry_waveform(void);
 void swim_phy_comm_reset(void);
+bool swim_phy_comm_reset_wait_sync(uint32_t timeout_us);
 bool swim_phy_write_bit(bool bit);
+bool swim_phy_write_frame_bits(uint32_t bits_msb_first, unsigned bit_count);
+bool swim_phy_write_frame_bits_read_ack(uint32_t bits_msb_first, unsigned bit_count, uint32_t timeout_us,
+                                        bool *ack);
 bool swim_phy_read_bit(uint32_t timeout_us, bool *ok);
 bool swim_phy_wait_sync(uint32_t timeout_us);
 bool swim_phy_timing_ready(void);
