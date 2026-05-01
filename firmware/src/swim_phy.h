@@ -19,6 +19,21 @@ typedef struct {
     swim_speed_t speed;
 } swim_phy_config_t;
 
+typedef enum {
+    SWIM_ENTER_STAGE_IDLE = 0,
+    SWIM_ENTER_STAGE_RESET_ASSERTED,
+    SWIM_ENTER_STAGE_ENTRY_SENT,
+    SWIM_ENTER_STAGE_SYNC1_OK,
+    SWIM_ENTER_STAGE_COMM_RESET_SENT,
+    SWIM_ENTER_STAGE_SYNC2_OK,
+    SWIM_ENTER_STAGE_SWIM_CSR_WRITE_START,
+    SWIM_ENTER_STAGE_SWIM_CSR_WRITE_OK,
+    SWIM_ENTER_STAGE_SWIM_CSR_READ_START,
+    SWIM_ENTER_STAGE_SWIM_CSR_READ_OK,
+    SWIM_ENTER_STAGE_DONE,
+    SWIM_ENTER_STAGE_FAIL,
+} swim_enter_stage_t;
+
 typedef struct {
     bool synced;
     swim_speed_t speed;
@@ -26,6 +41,13 @@ typedef struct {
     uint32_t last_sync_low_ns;
     uint32_t derived_tswim_ns;
     uint32_t sync_low_loop_count;
+
+    swim_enter_stage_t enter_stage;
+    bool comm_reset_sent;
+    bool second_sync_seen;
+    uint32_t comm_reset_low_us;
+    uint32_t comm_reset_low_ns;
+
     uint8_t swim_csr;
     bool swim_csr_valid;
     uint8_t phy_backend;
@@ -56,5 +78,9 @@ void swim_phy_reset_timing(void);
 void swim_phy_set_swim_csr_debug(uint8_t value, bool valid);
 swim_phy_debug_t swim_phy_get_debug(void);
 void swim_phy_debug_waveform(void);
+
+void swim_phy_set_enter_stage(swim_enter_stage_t stage);
+void swim_phy_mark_enter_fail(void);
+void swim_phy_mark_second_sync_seen(void);
 
 #endif

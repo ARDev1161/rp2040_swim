@@ -140,23 +140,45 @@ static rpsw_status_t handle_frame(const rpsw_frame_t *request,
 
     case CMD_GET_SWIM_DEBUG: {
         swim_phy_debug_t debug = swim_phy_get_debug();
+
         response[0] = debug.synced ? 1u : 0u;
         response[1] = (uint8_t)debug.speed;
         response[2] = debug.swim_csr_valid ? 1u : 0u;
         response[3] = debug.swim_csr;
+
         rpsw_put_u32le(&response[4], debug.last_sync_low_us);
         rpsw_put_u32le(&response[8], debug.last_sync_low_ns);
         rpsw_put_u32le(&response[12], debug.derived_tswim_ns);
         rpsw_put_u32le(&response[16], debug.sync_low_loop_count);
+
         response[20] = debug.phy_backend;
         response[21] = debug.pio_init_ok ? 1u : 0u;
         response[22] = debug.entry_slow_pulses;
         response[23] = debug.entry_fast_pulses;
         rpsw_put_u32le(&response[24], debug.entry_protocol_us);
+
+        /*
+         * Extended enter/debug fields.
+         *
+         * Keep old fields at 0..28 stable enough for older host tools, append new
+         * fields after entry_protocol_us.
+         */
+        response[28] = (uint8_t)debug.enter_stage;
+        response[29] = debug.comm_reset_sent ? 1u : 0u;
+        response[30] = debug.second_sync_seen ? 1u : 0u;
+        response[31] = 0u; /* reserved/alignment */
+
+        rpsw_put_u32le(&response[32], debug.comm_reset_low_us);
+        rpsw_put_u32le(&response[36], debug.comm_reset_low_ns);
+
         uint16_t pio_error_len = bounded_strlen(debug.pio_error, sizeof(debug.pio_error));
-        response[28] = (uint8_t)pio_error_len;
-        memcpy(&response[29], debug.pio_error, pio_error_len);
-        *response_len = (uint16_t)(29u + pio_error_len);
+        if (pio_error_len > 64u) {
+            pio_error_len = 64u;
+        }
+
+        response[40] = (uint8_t)pio_error_len;
+        memcpy(&response[41], debug.pio_error, pio_error_len);
+        *response_len = (uint16_t)(41u + pio_error_len);
         return RPSW_OK;
     }
 

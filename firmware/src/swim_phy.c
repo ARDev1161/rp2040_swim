@@ -42,18 +42,41 @@ static swim_phy_debug_t g_debug = {
 };
 
 static const swim_segment_t g_entry_segments[] = {
-    {SWIM_SEG_RELEASE, 10},
+    /*
+     * UM0470 Figure 5:
+     * - sequence starts with SWIM released/high,
+     * - force SWIM low for 16 us,
+     * - four pulses at 1 kHz,
+     * - four pulses at 2 kHz,
+     * - sequence ends with SWIM released/high.
+     */
+    {SWIM_SEG_RELEASE, 10},   // pre-settle before entry, not protocol timing
     {SWIM_SEG_LOW, 16},
+
     {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
     {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
     {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
     {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
+
     {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
     {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
     {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
     {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
-    {SWIM_SEG_RELEASE, 10},
+
+    {SWIM_SEG_RELEASE, 10},  // end released/high
 };
+
+void swim_phy_set_enter_stage(swim_enter_stage_t stage) {
+    g_debug.enter_stage = stage;
+}
+
+void swim_phy_mark_enter_fail(void) {
+    g_debug.enter_stage = SWIM_ENTER_STAGE_FAIL;
+}
+
+void swim_phy_mark_second_sync_seen(void) {
+    g_debug.second_sync_seen = true;
+}
 
 static void set_pio_debug(bool ok, const char *message) {
     g_debug.pio_init_ok = ok;
@@ -221,11 +244,27 @@ void swim_phy_comm_reset(void) {
      * low-speed 16 us reset frame only for debug waveform generation.
      */
     if (swim_phy_timing_ready()) {
+        uint32_t low_ns = clocks_to_ns(SWIM_SYNC_CLOCKS);
+        uint32_t low_us = (low_ns + 999u) / 1000u;
+
+        g_debug.comm_reset_sent = true;
+        g_debug.comm_reset_low_ns = low_ns;
+        g_debug.comm_reset_low_us = low_us;
+
         swim_phy_drive_low();
-        busy_wait_ns(clocks_to_ns(SWIM_SYNC_CLOCKS));
+        busy_wait_ns(low_ns);
         swim_phy_release();
-        busy_wait_ns(clocks_to_ns(SWIM_SYNC_CLOCKS));
+
+        /*
+         * Leave an idle/released window after reset. The target should answer
+         * with a sync frame after the communication reset.
+         */
+        busy_wait_ns(low_ns);
     } else {
+        g_debug.comm_reset_sent = true;
+        g_debug.comm_reset_low_ns = 16000u;
+        g_debug.comm_reset_low_us = 16u;
+
         pulse_low(16, 16);
     }
 }
@@ -338,6 +377,13 @@ void swim_phy_reset_timing(void) {
     g_debug.last_sync_low_ns = 0;
     g_debug.derived_tswim_ns = 0;
     g_debug.sync_low_loop_count = 0;
+
+    g_debug.enter_stage = SWIM_ENTER_STAGE_IDLE;
+    g_debug.comm_reset_sent = false;
+    g_debug.second_sync_seen = false;
+    g_debug.comm_reset_low_us = 0;
+    g_debug.comm_reset_low_ns = 0;
+
     g_debug.swim_csr = 0;
     g_debug.swim_csr_valid = false;
     g_debug.speed = g_phy.speed;

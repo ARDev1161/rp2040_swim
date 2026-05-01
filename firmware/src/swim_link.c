@@ -106,50 +106,73 @@ static rpsw_status_t recv_byte(uint8_t *byte) {
 rpsw_status_t swim_link_enter(void) {
     swim_phy_reset_timing();
     if (!swim_phy_set_speed(SWIM_SPEED_LOW)) {
+        swim_phy_mark_enter_fail();
         return RPSW_ERR_UNSUPPORTED;
     }
 
     swim_phy_release();
     swim_phy_nrst_assert();
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_RESET_ASSERTED);
     sleep_ms(2);
 
     rpsw_status_t st = swim_phy_entry_sequence_um0470();
     if (st != RPSW_OK) {
+        swim_phy_mark_enter_fail();
         swim_phy_release();
         swim_phy_nrst_release();
         return st;
     }
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_ENTRY_SENT);
+
     if (!swim_phy_wait_sync(SWIM_SYNC_TIMEOUT_US)) {
+        swim_phy_mark_enter_fail();
         swim_phy_release();
         swim_phy_nrst_release();
         return RPSW_ERR_SWIM_TIMEOUT;
     }
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SYNC1_OK);
 
     swim_phy_comm_reset();
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_COMM_RESET_SENT);
+
     if (!swim_phy_wait_sync(SWIM_SYNC_TIMEOUT_US)) {
+        swim_phy_mark_enter_fail();
         swim_phy_release();
         swim_phy_nrst_release();
         return RPSW_ERR_SWIM_TIMEOUT;
     }
+    swim_phy_mark_second_sync_seen();
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SYNC2_OK);
 
     uint8_t csr = SWIM_CSR_INIT_VALUE;
+
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_WRITE_START);
     st = swim_link_write(SWIM_CSR_ADDR, &csr, 1);
     if (st != RPSW_OK) {
+        swim_phy_mark_enter_fail();
         swim_phy_release();
         swim_phy_nrst_release();
         return st;
     }
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_WRITE_OK);
 
     uint8_t csr_readback = 0;
+
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_READ_START);
     st = swim_link_read(SWIM_CSR_ADDR, &csr_readback, 1);
     if (st != RPSW_OK) {
         swim_phy_set_swim_csr_debug(0, false);
+        swim_phy_mark_enter_fail();
         swim_phy_release();
         swim_phy_nrst_release();
         return st;
     }
+
     swim_phy_set_swim_csr_debug(csr_readback, true);
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_READ_OK);
+
     if ((csr_readback & SWIM_CSR_SWIM_DM) == 0u) {
+        swim_phy_mark_enter_fail();
         swim_phy_release();
         swim_phy_nrst_release();
         return RPSW_ERR_TARGET;
@@ -157,6 +180,8 @@ rpsw_status_t swim_link_enter(void) {
 
     swim_phy_nrst_release();
     sleep_ms(1);
+
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_DONE);
     return RPSW_OK;
 }
 

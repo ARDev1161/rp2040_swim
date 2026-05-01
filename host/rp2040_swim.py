@@ -26,6 +26,20 @@ STM8_FLASH_DUKR = 0x5064
 STM8_IAPSR_PUL = 0x02
 STM8_IAPSR_DUL = 0x08
 
+ENTER_STAGE_NAMES = {
+    0: "IDLE",
+    1: "RESET_ASSERTED",
+    2: "ENTRY_SENT",
+    3: "SYNC1_OK",
+    4: "COMM_RESET_SENT",
+    5: "SYNC2_OK",
+    6: "SWIM_CSR_WRITE_START",
+    7: "SWIM_CSR_WRITE_OK",
+    8: "SWIM_CSR_READ_START",
+    9: "SWIM_CSR_READ_OK",
+    10: "DONE",
+    11: "FAIL",
+}
 
 def parse_int(value: str) -> int:
     return int(value, 0)
@@ -71,6 +85,11 @@ def cmd_enter_debug(args: argparse.Namespace) -> int:
     print(f"last_sync_low_ns: {debug.last_sync_low_ns}")
     print(f"derived_tswim_ns: {debug.derived_tswim_ns}")
     print(f"sync_low_loop_count: {debug.sync_low_loop_count}")
+    print(f"enter_stage: {ENTER_STAGE_NAMES.get(debug.enter_stage, debug.enter_stage)}")
+    print(f"comm_reset_sent: {'yes' if debug.comm_reset_sent else 'no'}")
+    print(f"comm_reset_low_us: {debug.comm_reset_low_us}")
+    print(f"comm_reset_low_ns: {debug.comm_reset_low_ns}")
+    print(f"second_sync_seen: {'yes' if debug.second_sync_seen else 'no'}")
     print(f"phy_backend: {debug.phy_backend}")
     print(f"entry_protocol_us: {debug.entry_protocol_us}")
     print(f"entry_slow_pulses: {debug.entry_slow_pulses}")

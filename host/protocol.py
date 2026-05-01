@@ -82,6 +82,12 @@ class SwimDebug:
     pio_init_ok: bool = False
     pio_error: str = ""
 
+    enter_stage: int = 0
+    comm_reset_sent: bool = False
+    second_sync_seen: bool = False
+    comm_reset_low_us: int = 0
+    comm_reset_low_ns: int = 0
+
 
 def crc32(data: bytes) -> int:
     return binascii.crc32(data) & 0xFFFFFFFF
@@ -193,15 +199,24 @@ class Probe:
         payload = self.command(Command.GET_SWIM_DEBUG)
         if len(payload) < 20:
             raise ProtocolError("malformed SWIM debug response")
+
         synced, speed_raw, csr_valid, csr = payload[:4]
         last_sync_low_us, last_sync_low_ns, tswim_ns, loop_count = struct.unpack("<IIII", payload[4:20])
         speed = "low" if speed_raw == 0 else "high"
+
         phy_backend = "unknown"
         pio_init_ok = False
         entry_slow_pulses = 0
         entry_fast_pulses = 0
         entry_protocol_us = 0
         pio_error = ""
+
+        enter_stage = 0
+        comm_reset_sent = False
+        second_sync_seen = False
+        comm_reset_low_us = 0
+        comm_reset_low_ns = 0
+
         if len(payload) >= 29:
             backend_raw = payload[20]
             phy_backend = "pio" if backend_raw == 0 else "bitbang_fallback"
@@ -209,9 +224,34 @@ class Probe:
             entry_slow_pulses = payload[22]
             entry_fast_pulses = payload[23]
             entry_protocol_us = struct.unpack("<I", payload[24:28])[0]
-            error_len = payload[28]
-            if 29 + error_len <= len(payload):
-                pio_error = payload[29 : 29 + error_len].decode("ascii", "replace")
+
+            # New extended layout:
+            # 28 enter_stage
+            # 29 comm_reset_sent
+            # 30 second_sync_seen
+            # 31 reserved
+            # 32..35 comm_reset_low_us
+            # 36..39 comm_reset_low_ns
+            # 40 pio_error_len
+            # 41.. pio_error
+            if len(payload) >= 41:
+                enter_stage = payload[28]
+                comm_reset_sent = bool(payload[29])
+                second_sync_seen = bool(payload[30])
+                comm_reset_low_us = struct.unpack("<I", payload[32:36])[0]
+                comm_reset_low_ns = struct.unpack("<I", payload[36:40])[0]
+
+                error_len = payload[40]
+                if 41 + error_len <= len(payload):
+                    pio_error = payload[41 : 41 + error_len].decode("ascii", "replace")
+            else:
+                # Old layout:
+                # 28 pio_error_len
+                # 29.. pio_error
+                error_len = payload[28]
+                if 29 + error_len <= len(payload):
+                    pio_error = payload[29 : 29 + error_len].decode("ascii", "replace")
+
         return SwimDebug(
             synced=bool(synced),
             speed=speed,
@@ -227,6 +267,11 @@ class Probe:
             entry_fast_pulses=entry_fast_pulses,
             pio_init_ok=pio_init_ok,
             pio_error=pio_error,
+            enter_stage=enter_stage,
+            comm_reset_sent=comm_reset_sent,
+            second_sync_seen=second_sync_seen,
+            comm_reset_low_us=comm_reset_low_us,
+            comm_reset_low_ns=comm_reset_low_ns,
         )
 
     def reset_target(self) -> None:
