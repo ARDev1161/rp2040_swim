@@ -1,0 +1,23 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "hardware/pio.h"
+#include "pico/types.h"
+#include "usb_protocol.h"
+
+typedef struct {
+    uint32_t low_ticks;
+    uint32_t low_ns;
+    uint32_t low_us;
+    uint32_t loops_used;
+    bool timeout;
+} swim_pio_rx_width_t;
+
+rpsw_status_t swim_pio_rx_init(PIO pio, uint swim_pin);
+rpsw_status_t swim_pio_rx_arm_after_tx_done(uint32_t max_loop_count);
+rpsw_status_t swim_pio_rx_get_width(swim_pio_rx_width_t *out, uint32_t timeout_us);
+
+uint32_t swim_pio_rx_ns_to_max_loops(uint32_t max_ns);
+uint32_t swim_pio_rx_loops_to_ns(uint32_t loops);

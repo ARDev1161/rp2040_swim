@@ -76,6 +76,34 @@ def test_real_entry_path_skips_debug_end_settle_for_fast_sync() -> None:
     assert "(void)emit_entry_segments(entry_segment_count());" in source
 
 
+def test_enter_flow_restores_comm_reset_and_second_sync_before_csr() -> None:
+    source = (REPO_ROOT / "firmware/src/swim_link.c").read_text()
+    sync1 = source.index("SWIM_ENTER_STAGE_SYNC1_OK")
+    comm_reset = source.index("swim_phy_comm_reset_wait_sync(SWIM_SYNC_TIMEOUT_US)")
+    sync2 = source.index("SWIM_ENTER_STAGE_SYNC2_OK")
+    csr_write = source.index("SWIM_ENTER_STAGE_SWIM_CSR_WRITE_START")
+    assert sync1 < comm_reset < sync2 < csr_write
+    assert "swim_phy_mark_second_sync_seen();" in source
+
+
+def test_sync_detection_filters_short_lows_and_accepts_plausible_window() -> None:
+    phy_source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
+    pio_source = (REPO_ROOT / "firmware/src/swim_pio_waveform.c").read_text()
+    for source in (phy_source, pio_source):
+        assert "#define SWIM_SYNC_IGNORE_SHORT_US 10u" in source
+        assert "#define SWIM_SYNC_MIN_US 10u" in source
+        assert "#define SWIM_SYNC_MAX_US 300u" in source
+        assert "sync_low_width_is_plausible" in source
+
+
+def test_comm_reset_wait_restores_irq_before_waiting_for_sync() -> None:
+    source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
+    function = source[source.index("bool swim_phy_comm_reset_wait_sync"):]
+    function = function[:function.index("bool swim_phy_write_bit")]
+    assert function.index("swim_phy_sio_release_fast();") < function.index("restore_interrupts(irq_state);")
+    assert function.rindex("restore_interrupts(irq_state);") < function.rindex("return wait_sync_fast(timeout_us);")
+
+
 def test_entry_waveform_command_exists() -> None:
     parser = build_parser()
     args = parser.parse_args(["entry-waveform", "--port", "/dev/null", "--delay-ms", "1"])

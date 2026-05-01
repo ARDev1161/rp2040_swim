@@ -8,10 +8,10 @@
 #include "pico/platform.h"
 #include "pico/stdlib.h"
 #include "swim_pio_waveform.h"
+#include "swim_sync_limits.h"
 #include <stdio.h>
 #include <string.h>
 
-#define SWIM_SYNC_CLOCKS 128u
 #define SWIM_LOW_SPEED_ONE_LOW_CLOCKS 2u
 #define SWIM_LOW_SPEED_ONE_HIGH_CLOCKS 20u
 #define SWIM_LOW_SPEED_ZERO_LOW_CLOCKS 20u
@@ -24,6 +24,7 @@
 #define SWIM_ENTRY_SLOW_PULSES 4u
 #define SWIM_ENTRY_FAST_PULSES 4u
 #define SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK 8u
+
 
 static swim_phy_config_t g_phy = {
     .swim_pin = RP2040_SWIM_DEFAULT_SWIM_PIN,
@@ -281,6 +282,20 @@ static void update_low_speed_cycle_cache(void) {
         swim_clocks_to_cycles_from_tswim(g_debug.derived_tswim_ns, SWIM_LOW_SPEED_ZERO_HIGH_CLOCKS);
 }
 
+static void record_sync_measurement_ns(uint32_t elapsed_ns, uint32_t low_count) {
+    uint32_t elapsed_us = (elapsed_ns + 999u) / 1000u;
+    uint32_t tswim_ns = (elapsed_ns + (SWIM_SYNC_CLOCKS / 2u)) / SWIM_SYNC_CLOCKS;
+
+    g_debug.synced = true;
+    g_debug.speed = SWIM_SPEED_LOW;
+    g_debug.last_sync_low_us = elapsed_us;
+    g_debug.last_sync_low_ns = elapsed_ns;
+    g_debug.derived_tswim_ns = tswim_ns;
+    g_debug.sync_low_loop_count = low_count;
+    g_phy.speed = SWIM_SPEED_LOW;
+    update_low_speed_cycle_cache();
+}
+
 rpsw_status_t swim_phy_entry_sequence_um0470(void) {
     /*
      * UM0470 Rev 4 section 3.2:
@@ -299,42 +314,35 @@ rpsw_status_t swim_phy_entry_sequence_um0470(void) {
 }
 
 bool swim_phy_entry_sequence_um0470_wait_sync(uint32_t timeout_us) {
+    swim_pio_rx_width_t width = {0};
+
     /*
-     * Match the proven esp-stlink flow: release SWIM at the end of the entry
-     * waveform and immediately wait for the STM8 synchronization low pulse.
-     * Some STM8S003 parts start that pulse only a few tens of microseconds
-     * after the final fast entry pulse, so do not return through higher-level
-     * debug/state bookkeeping before sampling the line.
+     * Real STM8S003 currently answers with a short sync-like low around
+     * 16..17 us. Give the RX state machine enough budget for up to 300 us.
      */
-    if (swim_pio_waveform_available()) {
-        swim_pio_sync_measurement_t sync = {0};
-        rpsw_status_t st = swim_pio_emit_segments_wait_sync(
-            g_entry_segments, entry_segment_count() - 1u, timeout_us, &sync);
-        if (st != RPSW_OK) {
-            g_debug.phy_backend = SWIM_PHY_BACKEND_PIO;
-            set_pio_debug(true, swim_pio_waveform_error());
-            return false;
-        }
-        uint32_t tswim_ns = (sync.low_ns + (SWIM_SYNC_CLOCKS / 2u)) / SWIM_SYNC_CLOCKS;
-        if (tswim_ns == 0) {
-            set_pio_debug(true, "bad sync measurement");
-            return false;
-        }
-        g_debug.phy_backend = SWIM_PHY_BACKEND_PIO;
-        set_pio_debug(true, "ok");
-        g_debug.synced = true;
-        g_debug.speed = SWIM_SPEED_LOW;
-        g_debug.last_sync_low_us = sync.low_us;
-        g_debug.last_sync_low_ns = sync.low_ns;
-        g_debug.derived_tswim_ns = tswim_ns;
-        g_debug.sync_low_loop_count = sync.low_loop_count;
-        g_phy.speed = SWIM_SPEED_LOW;
-        update_low_speed_cycle_cache();
-        swim_phy_sio_input();
-        return true;
+    uint32_t max_loops = swim_pio_rx_ns_to_max_loops(300000u);
+
+    rpsw_status_t st = swim_pio_emit_segments_capture_response(
+        g_entry_segments,
+        entry_segment_count() - 1u,
+        max_loops,
+        timeout_us,
+        &width
+    );
+
+    if (st != RPSW_OK) {
+        set_pio_debug(true, swim_pio_waveform_error());
+        return false;
     }
 
-    return swim_phy_entry_sequence_um0470() == RPSW_OK && swim_phy_wait_sync(timeout_us);
+    if (width.timeout || width.low_us < 8u || width.low_us > 300u) {
+        set_pio_debug(true, "PIO RX sync width out of range");
+        return false;
+    }
+
+    record_sync_measurement_ns(width.low_ns, width.loops_used);
+    set_pio_debug(true, "ok");
+    return true;
 }
 
 void swim_phy_entry_waveform(void) {
@@ -396,20 +404,11 @@ static bool wait_sync_fast(uint32_t timeout_us) {
         }
 
         uint32_t elapsed_us = (uint32_t)elapsed_us64;
-        uint32_t elapsed_ns = elapsed_us * 1000u;
-        uint32_t tswim_ns = (elapsed_ns + (SWIM_SYNC_CLOCKS / 2u)) / SWIM_SYNC_CLOCKS;
-        if (tswim_ns == 0) {
+        if (!swim_sync_low_width_is_plausible_us(elapsed_us)) {
             continue;
         }
 
-        g_debug.synced = true;
-        g_debug.speed = SWIM_SPEED_LOW;
-        g_debug.last_sync_low_us = elapsed_us;
-        g_debug.last_sync_low_ns = elapsed_ns;
-        g_debug.derived_tswim_ns = tswim_ns;
-        g_debug.sync_low_loop_count = low_count;
-        g_phy.speed = SWIM_SPEED_LOW;
-        update_low_speed_cycle_cache();
+        record_sync_measurement_ns((uint32_t)(elapsed_us * 1000u), low_count);
         return true;
     }
     return false;
@@ -428,14 +427,54 @@ bool swim_phy_comm_reset_wait_sync(uint32_t timeout_us) {
     g_debug.comm_reset_low_ns = low_ns;
     g_debug.comm_reset_low_us = low_us;
 
-    swim_phy_sio_input();
-    uint32_t irq_state = save_and_disable_interrupts();
-    swim_phy_sio_drive_low_fast();
-    busy_wait_ns(low_ns);
-    swim_phy_sio_release_fast();
-    bool ok = wait_sync_fast(timeout_us);
-    restore_interrupts(irq_state);
-    return ok;
+    if (g_debug.derived_tswim_ns == 0u) {
+        set_pio_debug(true, "missing Tswim for comm reset");
+        return false;
+    }
+
+    uint32_t tick_hz = 1000000000u / g_debug.derived_tswim_ns;
+    if (tick_hz == 0u) {
+        set_pio_debug(true, "bad Tswim for comm reset");
+        return false;
+    }
+
+    /*
+     * Communication reset:
+     *   host LOW for 128 SWIM clocks, then release.
+     *
+     * TX PIO releases SWIM and raises IRQ0.
+     * RX PIO is already armed and captures the target's second sync pulse
+     * immediately after release, avoiding C polling latency.
+     */
+    swim_pio_tick_segment_t segments[] = {
+        { .level = SWIM_SEG_LOW, .duration_ticks = SWIM_SYNC_CLOCKS },
+    };
+
+    swim_pio_rx_width_t width = {0};
+    uint32_t max_loops = swim_pio_rx_ns_to_max_loops(300000u);
+
+    rpsw_status_t st = swim_pio_emit_tick_segments_capture_response(
+        segments,
+        1u,
+        tick_hz,
+        max_loops,
+        timeout_us,
+        &width
+    );
+
+    if (st != RPSW_OK) {
+        set_pio_debug(true, swim_pio_waveform_error());
+        return false;
+    }
+
+    if (width.timeout || width.low_us < 8u || width.low_us > 300u) {
+        set_pio_debug(true, "PIO RX second sync width out of range");
+        return false;
+    }
+
+    record_sync_measurement_ns(width.low_ns, width.loops_used);
+    set_pio_debug(true, "ok");
+    return true;
 }
 
 bool swim_phy_write_bit(bool bit) {
@@ -573,42 +612,39 @@ bool swim_phy_read_bit(uint32_t timeout_us, bool *ok) {
 
 bool swim_phy_wait_sync(uint32_t timeout_us) {
     absolute_time_t deadline = make_timeout_time_us(timeout_us);
-    while (swim_phy_sample()) {
-        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-            return false;
+    while (absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+        while (swim_phy_sample()) {
+            if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+                return false;
+            }
+            tight_loop_contents();
         }
-    }
 
-    uint64_t start_us = time_us_64();
-    uint32_t low_count = 0;
-    while (!swim_phy_sample()) {
-        low_count++;
-        tight_loop_contents();
-        if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-            return false;
+        uint64_t start_us = time_us_64();
+        uint32_t low_count = 0;
+        while (!swim_phy_sample()) {
+            low_count++;
+            tight_loop_contents();
+            if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+                return false;
+            }
         }
-    }
-    uint64_t elapsed_us64 = time_us_64() - start_us;
-    if (elapsed_us64 == 0 || elapsed_us64 > UINT32_MAX || low_count == 0) {
-        return false;
+
+        uint64_t elapsed_us64 = time_us_64() - start_us;
+        if (elapsed_us64 == 0 || elapsed_us64 > UINT32_MAX || low_count == 0) {
+            continue;
+        }
+
+        uint32_t elapsed_us = (uint32_t)elapsed_us64;
+        if (!swim_sync_low_width_is_plausible_us(elapsed_us)) {
+            continue;
+        }
+
+        record_sync_measurement_ns((uint32_t)(elapsed_us * 1000u), low_count);
+        return true;
     }
 
-    uint32_t elapsed_us = (uint32_t)elapsed_us64;
-    uint32_t elapsed_ns = elapsed_us * 1000u;
-    uint32_t tswim_ns = (elapsed_ns + (SWIM_SYNC_CLOCKS / 2u)) / SWIM_SYNC_CLOCKS;
-    if (tswim_ns == 0) {
-        return false;
-    }
-
-    g_debug.synced = true;
-    g_debug.speed = SWIM_SPEED_LOW;
-    g_debug.last_sync_low_us = elapsed_us;
-    g_debug.last_sync_low_ns = elapsed_ns;
-    g_debug.derived_tswim_ns = tswim_ns;
-    g_debug.sync_low_loop_count = low_count;
-    g_phy.speed = SWIM_SPEED_LOW;
-    update_low_speed_cycle_cache();
-    return true;
+    return false;
 }
 
 bool swim_phy_timing_ready(void) {

@@ -5,7 +5,7 @@
 ; Each TX FIFO word is:
 ;   bit 0     level: 0 = release/high-Z, 1 = drive low
 ;   bits 1-31 adjusted loop count
-;   word 0    sentinel: release, raise IRQ 0, and block
+;   word 0    sentinel: release, set IRQ 0, and block
 ;
 ; The C driver sets the GPIO output value to 0 before the PIO owns the pin.
 ; SET PINDIRS therefore only switches between high-Z and output-low; this
@@ -37,6 +37,6 @@ release_loop:
     jmp start
 done:
     set pindirs, 0
-    irq 0
+    irq set 0
     pull block
 .wrap

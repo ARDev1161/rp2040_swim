@@ -20,6 +20,7 @@ add_executable(rp2040_swim
     src/main.c
     src/usb_protocol.c
     src/swim_pio_waveform.c
+    src/swim_pio_rx.c
     src/swim_phy.c
     src/swim_link.c
     src/stm8_dm.c
@@ -28,6 +29,7 @@ add_executable(rp2040_swim
 )
 
 pico_generate_pio_header(rp2040_swim ${CMAKE_CURRENT_LIST_DIR}/pio/swim_waveform.pio)
+pico_generate_pio_header(rp2040_swim ${CMAKE_CURRENT_LIST_DIR}/pio/swim_rx_width.pio)
 
 target_include_directories(rp2040_swim PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src

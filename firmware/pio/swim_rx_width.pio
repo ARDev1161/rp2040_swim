@@ -1,0 +1,37 @@
+.program swim_rx_width
+
+; Measures LOW pulse width on SWIM pin.
+;
+; C pushes max_loop_count into TX FIFO.
+; RX waits for PIO IRQ 0 from TX engine.
+; Then waits for SWIM falling edge.
+; Then counts while SWIM is low.
+; Pushes remaining X to RX FIFO.
+;
+; Pin mapping:
+;   in_base/jmp_pin = SWIM pin
+
+.wrap_target
+start:
+    pull block
+    mov x, osr
+
+    ; Wait until TX says "line released, target may respond now".
+    wait 1 irq 0
+
+wait_low:
+    wait 0 pin 0
+
+measure_low:
+    jmp pin done
+    jmp x-- measure_low
+
+    ; Timeout while line stays low: push remaining x and restart.
+    mov isr, x
+    push block
+    jmp start
+
+done:
+    mov isr, x
+    push block
+.wrap
