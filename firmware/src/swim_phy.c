@@ -44,14 +44,14 @@ static swim_phy_debug_t g_debug = {
 static const swim_segment_t g_entry_segments[] = {
     {SWIM_SEG_RELEASE, 10},
     {SWIM_SEG_LOW, 16},
-    {SWIM_SEG_LOW, 500}, {SWIM_SEG_RELEASE, 500},
-    {SWIM_SEG_LOW, 500}, {SWIM_SEG_RELEASE, 500},
-    {SWIM_SEG_LOW, 500}, {SWIM_SEG_RELEASE, 500},
-    {SWIM_SEG_LOW, 500}, {SWIM_SEG_RELEASE, 500},
-    {SWIM_SEG_LOW, 250}, {SWIM_SEG_RELEASE, 250},
-    {SWIM_SEG_LOW, 250}, {SWIM_SEG_RELEASE, 250},
-    {SWIM_SEG_LOW, 250}, {SWIM_SEG_RELEASE, 250},
-    {SWIM_SEG_LOW, 250}, {SWIM_SEG_RELEASE, 250},
+    {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
+    {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
+    {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
+    {SWIM_SEG_RELEASE, 500}, {SWIM_SEG_LOW, 500},
+    {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
+    {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
+    {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
+    {SWIM_SEG_RELEASE, 250}, {SWIM_SEG_LOW, 250},
     {SWIM_SEG_RELEASE, 10},
 };
 
@@ -59,6 +59,12 @@ static void set_pio_debug(bool ok, const char *message) {
     g_debug.pio_init_ok = ok;
     snprintf(g_debug.pio_error, sizeof(g_debug.pio_error), "%s",
              message != NULL ? message : "");
+}
+
+static void set_pio_fallback_warning(const char *message) {
+    g_debug.pio_init_ok = false;
+    snprintf(g_debug.pio_error, sizeof(g_debug.pio_error), "warning: bitbang fallback; %s",
+             message != NULL && message[0] != '\0' ? message : "PIO unavailable");
 }
 
 static void swim_release_pin(uint pin, bool pullup) {
@@ -87,7 +93,7 @@ void swim_phy_init(const swim_phy_config_t *config) {
         set_pio_debug(true, "ok");
     } else {
         g_debug.phy_backend = SWIM_PHY_BACKEND_BITBANG_FALLBACK;
-        set_pio_debug(false, swim_pio_waveform_error());
+        set_pio_fallback_warning(swim_pio_waveform_error());
     }
 }
 
@@ -184,7 +190,6 @@ rpsw_status_t swim_phy_entry_sequence_um0470(void) {
      * - four pulses at 2 kHz,
      * sequence starts and ends released/high.
      */
-    swim_phy_release();
     if (swim_pio_waveform_available()) {
         rpsw_status_t st = swim_pio_emit_segments(g_entry_segments,
                                                   sizeof(g_entry_segments) / sizeof(g_entry_segments[0]));
@@ -196,8 +201,9 @@ rpsw_status_t swim_phy_entry_sequence_um0470(void) {
         }
         return st;
     }
+    swim_phy_release();
     g_debug.phy_backend = SWIM_PHY_BACKEND_BITBANG_FALLBACK;
-    set_pio_debug(false, swim_pio_waveform_error());
+    set_pio_fallback_warning(swim_pio_waveform_error());
     bitbang_emit_segments(g_entry_segments, sizeof(g_entry_segments) / sizeof(g_entry_segments[0]));
     swim_phy_release();
     return RPSW_OK;

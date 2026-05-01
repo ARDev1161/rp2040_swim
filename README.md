@@ -83,6 +83,9 @@ Implemented:
 - Open-drain style SWIM/NRST GPIO handling for RP2040-Zero default pins.
 - PIO-generated UM0470 SWIM activation waveform using open-drain pin direction
   control. C bit-bang entry is fallback/debug only when PIO init fails.
+  The PIO state machine runs at 10 MHz, so one PIO tick is 0.1 us; the firmware
+  encodes each segment as `duration_us * 10 - 8` ticks to account for fixed PIO
+  instruction overhead between pin-direction changes.
 - Low-speed bit primitives for post-entry communication.
 - Target synchronization-frame measurement and low-speed timing derivation.
 - `SWIM_CSR=0xA0` initialization before memory access.
@@ -109,6 +112,8 @@ python3 host/rp2040_swim.py entry-waveform --port /dev/ttyACM0 --pullup --delay-
 Inspect GPIO2 for the activation sequence: 16 us low, four 1 kHz pulses, and
 four 2 kHz pulses. `entry-waveform` holds NRST low only during the waveform,
 does not wait for STM8 sync, and does not access target memory.
+It prints `initial_low_us=16`, `slow_pulses=4`, `slow_period_us=1000`,
+`fast_pulses=4`, `fast_period_us=500`, and `total_entry_protocol_us=6016`.
 
 Two-Pico capture:
 

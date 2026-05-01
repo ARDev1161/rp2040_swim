@@ -7,6 +7,8 @@
   measuring the target synchronization frame.
 - UM0470 entry waveform uses PIO by default with open-drain pin-direction
   control. C bit-bang entry is fallback/debug only if PIO initialization fails.
+  The PIO segment clock is 10 MHz: one tick is 0.1 us, and fixed instruction
+  overhead is subtracted when each microsecond segment is encoded.
 - Post-entry SWIM TX/RX is currently C bit-banged and calibrated from the target
   synchronization frame.
 - Program flash erase/write is guarded and returns an error until verified on
@@ -21,7 +23,7 @@ Logic analyzer test points:
 
 - Run `entry-waveform`, then inspect GPIO2 for the 16 us low activation pulse,
   four 1 kHz pulses, and four 2 kHz pulses. This command does not wait for STM8
-  sync and does not access target memory.
+  sync and does not access target memory; it releases NRST after the waveform.
 - With a second Pico analyzer, capture at 10 MS/s for 10 ms while running:
   `python3 host/rp2040_swim.py entry-waveform --port /dev/ttyACM0 --pullup --delay-ms 1000`.
 - Run firmware command `DEBUG_WAVEFORM` from a host script to emit a repeatable

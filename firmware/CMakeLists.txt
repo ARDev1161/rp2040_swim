@@ -27,7 +27,7 @@ add_executable(rp2040_swim
     src/target_db.c
 )
 
-pico_generate_pio_header(rp2040_swim ${CMAKE_CURRENT_LIST_DIR}/src/swim_waveform.pio)
+pico_generate_pio_header(rp2040_swim ${CMAKE_CURRENT_LIST_DIR}/pio/swim_waveform.pio)
 
 target_include_directories(rp2040_swim PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src

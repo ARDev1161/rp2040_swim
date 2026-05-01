@@ -31,15 +31,15 @@ def um0470_entry_segments() -> list[EntrySegment]:
     for _ in range(ENTRY_SLOW_PULSES):
         segments.extend(
             [
-                EntrySegment(SegmentLevel.LOW, 500),
                 EntrySegment(SegmentLevel.RELEASE, 500),
+                EntrySegment(SegmentLevel.LOW, 500),
             ]
         )
     for _ in range(ENTRY_FAST_PULSES):
         segments.extend(
             [
-                EntrySegment(SegmentLevel.LOW, 250),
                 EntrySegment(SegmentLevel.RELEASE, 250),
+                EntrySegment(SegmentLevel.LOW, 250),
             ]
         )
     segments.append(EntrySegment(SegmentLevel.RELEASE, 10))

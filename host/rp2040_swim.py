@@ -13,6 +13,7 @@ from entry_waveform import (
     ENTRY_PROTOCOL_US,
     ENTRY_SLOW_PERIOD_US,
     ENTRY_SLOW_PULSES,
+    um0470_entry_segments,
 )
 from ihex import HexError, image_for_range, load_ihex
 from protocol import Probe, ProtocolError, autodetect_port, list_serial_ports
@@ -97,6 +98,9 @@ def cmd_entry_waveform(args: argparse.Namespace) -> int:
     print(f"fast_pulses={ENTRY_FAST_PULSES}")
     print(f"fast_period_us={ENTRY_FAST_PERIOD_US}")
     print(f"total_entry_protocol_us={ENTRY_PROTOCOL_US}")
+    for index, segment in enumerate(um0470_entry_segments()):
+        level = "low" if int(segment.level) == 1 else "release"
+        print(f"segment[{index}] level={level} requested_duration_us={segment.duration_us}")
     with open_probe(args) as probe:
         print(probe.version())
         probe.entry_waveform(args.delay_ms)
