@@ -8,9 +8,9 @@
 
 /*
  * Real STM8S003 observations:
- * - short post-entry lows around 16..17 us must be ignored;
- * - plausible sync candidates may be around 33 us, 62 us, or 128 us
- *   depending on target timing / measurement path.
+ * - first sync may be around 16..17 us when SWIM clock is near 8 MHz;
+ * - slower sync candidates around 33 us, 62 us, or 128 us are also plausible
+ *   depending on target timing and measurement path.
  */
 #define SWIM_SYNC_IGNORE_SHORT_US 8u
 #define SWIM_SYNC_MIN_US 12u

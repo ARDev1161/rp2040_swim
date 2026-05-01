@@ -122,7 +122,12 @@ rpsw_status_t swim_pio_rx_get_width(swim_pio_rx_width_t *out, uint32_t timeout_u
 
     while (pio_sm_is_rx_fifo_empty(g_rx_pio, g_rx_sm)) {
         if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+            out->low_ticks = 0;
+            out->low_ns = 0;
+            out->low_us = 0;
+            out->loops_used = 0;
             out->timeout = true;
+            pio_sm_set_enabled(g_rx_pio, g_rx_sm, false);
             return RPSW_ERR_SWIM_TIMEOUT;
         }
         tight_loop_contents();

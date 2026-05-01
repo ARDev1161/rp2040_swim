@@ -88,20 +88,22 @@ def test_enter_flow_restores_comm_reset_and_second_sync_before_csr() -> None:
 
 def test_sync_detection_filters_short_lows_and_accepts_plausible_window() -> None:
     phy_source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
-    pio_source = (REPO_ROOT / "firmware/src/swim_pio_waveform.c").read_text()
-    for source in (phy_source, pio_source):
-        assert "#define SWIM_SYNC_IGNORE_SHORT_US 10u" in source
-        assert "#define SWIM_SYNC_MIN_US 10u" in source
-        assert "#define SWIM_SYNC_MAX_US 300u" in source
-        assert "sync_low_width_is_plausible" in source
+    limits_source = (REPO_ROOT / "firmware/src/swim_sync_limits.h").read_text()
+    assert "#define SWIM_SYNC_IGNORE_SHORT_US 8u" in limits_source
+    assert "#define SWIM_SYNC_MIN_US 12u" in limits_source
+    assert "#define SWIM_SYNC_MAX_US 300u" in limits_source
+    assert "swim_sync_low_width_is_plausible_us" in limits_source
+    assert "swim_sync_low_width_is_plausible_us(elapsed_us)" in phy_source
 
 
-def test_comm_reset_wait_restores_irq_before_waiting_for_sync() -> None:
+def test_comm_reset_wait_uses_pio_tick_tx_and_rx_capture() -> None:
     source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
     function = source[source.index("bool swim_phy_comm_reset_wait_sync"):]
     function = function[:function.index("bool swim_phy_write_bit")]
-    assert function.index("swim_phy_sio_release_fast();") < function.index("restore_interrupts(irq_state);")
-    assert function.rindex("restore_interrupts(irq_state);") < function.rindex("return wait_sync_fast(timeout_us);")
+    assert "swim_pio_emit_tick_segments_capture_response" in function
+    assert ".duration_ticks = SWIM_SYNC_CLOCKS" in function
+    assert ".level = SWIM_SEG_RELEASE" not in function
+    assert "record_sync_measurement_ns(width.low_ns, width.loops_used);" in function
 
 
 def test_entry_waveform_command_exists() -> None:
