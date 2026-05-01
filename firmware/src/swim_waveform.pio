@@ -1,0 +1,35 @@
+.program swim_waveform
+;
+; Open-drain SWIM waveform segment engine.
+;
+; Each TX FIFO word is:
+;   bit 0     level: 0 = release/high-Z, 1 = drive low
+;   bits 1-31 adjusted loop count
+;
+; The C driver sets the GPIO output value to 0 before the PIO owns the pin.
+; SET PINDIRS therefore only switches between high-Z and output-low; this
+; program never actively drives the line high.
+;
+; The level duration is adjusted in C so that:
+;   requested_ticks = adjusted_count + 7
+;
+; This accounts for the SET instruction, loop fall-through, jump-to-start, and
+; fixed command decode cycles before the next SET PINDIRS changes the line.
+
+.wrap_target
+start:
+    pull block
+    out y, 1
+    out x, 31
+    jmp !y release
+drive_low:
+    set pindirs, 1
+low_loop:
+    jmp x-- low_loop
+    jmp start
+release:
+    set pindirs, 0
+release_loop:
+    jmp x-- release_loop
+    jmp start
+.wrap

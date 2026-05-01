@@ -1,0 +1,5 @@
+; Optional future RX sampler. Not built yet.
+.program swim_rx
+wait 0 pin 0
+in pins, 1
+push block
