@@ -1,37 +1,42 @@
 .program swim_rx_width
 
-; Measures LOW pulse width on SWIM pin.
+; SWIM RX low-width burst capture.
 ;
-; C pushes max_loop_count into TX FIFO.
-; RX waits for PIO IRQ 0 from TX engine.
-; Then waits for SWIM falling edge.
-; Then counts while SWIM is low.
-; Pushes remaining X to RX FIFO.
+; C pushes:
+;   1) count_minus_1
+;   2) max_loop_count
 ;
-; Pin mapping:
-;   in_base/jmp_pin = SWIM pin
+; Program waits for PIO IRQ 0 from TX waveform engine.
+; Then for each requested low pulse:
+;   - wait for falling edge
+;   - count while SWIM is low
+;   - push remaining X
+;
+; C computes:
+;   loops_used = max_loop_count - remaining_x
+;
+; The same program is used for:
+;   - single sync / ACK / bit capture: count_minus_1 = 0
+;   - ACK + 10-bit frame burst:       count_minus_1 = 10
 
 .wrap_target
 start:
     pull block
-    mov x, osr
+    mov y, osr
+    pull block
 
-    ; Wait until TX says "line released, target may respond now".
     wait 1 irq 0
 
-wait_low:
+next_width:
+    mov x, osr
     wait 0 pin 0
 
-measure_low:
-    jmp pin done
-    jmp x-- measure_low
+width_loop:
+    jmp pin width_done
+    jmp x-- width_loop
 
-    ; Timeout while line stays low: push remaining x and restart.
+width_done:
     mov isr, x
     push block
-    jmp start
-
-done:
-    mov isr, x
-    push block
+    jmp y-- next_width
 .wrap

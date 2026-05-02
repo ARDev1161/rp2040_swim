@@ -35,10 +35,20 @@ static rpsw_status_t read_ack(void) {
     return ack ? RPSW_OK : RPSW_ERR_SWIM_NACK;
 }
 
+static const char *command_name(uint8_t command) {
+    switch (command) {
+    case SWIM_CMD_SRST: return "SRST";
+    case SWIM_CMD_ROTF: return "ROTF";
+    case SWIM_CMD_WOTF: return "WOTF";
+    default: return "CMD";
+    }
+}
+
 static rpsw_status_t send_command(uint8_t command) {
     if (!swim_phy_timing_ready()) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
+    swim_phy_set_tx_context(command_name(command));
     uint32_t frame = ((uint32_t)(command & 0x7u) << 1u) | (parity3(command) ? 1u : 0u);
     bool ack = false;
     if (!swim_phy_write_frame_bits_read_ack(frame, 5, SWIM_ACK_TIMEOUT_US, &ack)) {
@@ -47,10 +57,11 @@ static rpsw_status_t send_command(uint8_t command) {
     return ack ? RPSW_OK : RPSW_ERR_SWIM_NACK;
 }
 
-static rpsw_status_t send_byte(uint8_t byte) {
+static rpsw_status_t send_byte_labeled(uint8_t byte, const char *label) {
     if (!swim_phy_timing_ready()) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
+    swim_phy_set_tx_context(label);
     uint32_t frame = ((uint32_t)byte << 1u) | (parity8(byte) ? 1u : 0u);
     bool ack = false;
     if (!swim_phy_write_frame_bits_read_ack(frame, 10, SWIM_ACK_TIMEOUT_US, &ack)) {
@@ -59,29 +70,14 @@ static rpsw_status_t send_byte(uint8_t byte) {
     return ack ? RPSW_OK : RPSW_ERR_SWIM_NACK;
 }
 
-static rpsw_status_t recv_byte(uint8_t *byte) {
-    bool ok = false;
-    bool header = swim_phy_read_bit(SWIM_READ_TIMEOUT_US, &ok);
-    if (!ok) {
-        return RPSW_ERR_SWIM_TIMEOUT;
-    }
+static rpsw_status_t decode_data_frame(uint32_t frame, uint8_t *byte) {
+    bool header = ((frame >> 9u) & 1u) != 0u;
     if (!header) {
         return RPSW_ERR_TARGET;
     }
 
-    uint8_t value = 0;
-    for (unsigned bit = 0; bit < 8; bit++) {
-        bool b = swim_phy_read_bit(SWIM_READ_TIMEOUT_US, &ok);
-        if (!ok) {
-            return RPSW_ERR_SWIM_TIMEOUT;
-        }
-        value = (uint8_t)((value << 1) | (b ? 1u : 0u));
-    }
-
-    bool parity = swim_phy_read_bit(SWIM_READ_TIMEOUT_US, &ok);
-    if (!ok) {
-        return RPSW_ERR_SWIM_TIMEOUT;
-    }
+    uint8_t value = (uint8_t)((frame >> 1u) & 0xffu);
+    bool parity = (frame & 1u) != 0u;
     if (parity != parity8(value)) {
         (void)swim_phy_write_frame_bits(0u, 1);
         return RPSW_ERR_TARGET;
@@ -92,6 +88,34 @@ static rpsw_status_t recv_byte(uint8_t *byte) {
     }
     *byte = value;
     return RPSW_OK;
+}
+
+static rpsw_status_t recv_byte(uint8_t *byte) {
+    uint32_t frame = 0;
+    if (!swim_phy_read_frame_bits(SWIM_READ_TIMEOUT_US, &frame)) {
+        return RPSW_ERR_SWIM_TIMEOUT;
+    }
+    return decode_data_frame(frame, byte);
+}
+
+static rpsw_status_t send_byte_read_ack_frame_labeled(uint8_t byte, uint8_t *target_byte,
+                                                      const char *label) {
+    if (!swim_phy_timing_ready()) {
+        return RPSW_ERR_SWIM_TIMEOUT;
+    }
+
+    swim_phy_set_tx_context(label);
+
+    uint32_t tx_frame = ((uint32_t)byte << 1u) | (parity8(byte) ? 1u : 0u);
+    uint32_t rx_frame = 0;
+
+    if (!swim_phy_write_frame_bits_read_ack_and_frame(tx_frame, 10u,
+        SWIM_READ_TIMEOUT_US,
+        &rx_frame)) {
+        return RPSW_ERR_SWIM_TIMEOUT;
+    }
+
+    return decode_data_frame(rx_frame, target_byte);
 }
 
 rpsw_status_t swim_link_enter(void) {
@@ -178,16 +202,17 @@ rpsw_status_t swim_link_read(uint32_t address, uint8_t *data, size_t len) {
     uint32_t irq_state = save_and_disable_interrupts();
     rpsw_status_t st = send_command(SWIM_CMD_ROTF);
     if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)len);
+    st = send_byte_labeled((uint8_t)len, "ROTF len");
     if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)((address >> 16) & 0xffu));
+    st = send_byte_labeled((uint8_t)((address >> 16) & 0xffu), "ROTF AE");
     if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)((address >> 8) & 0xffu));
-    if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)(address & 0xffu));
+    st = send_byte_labeled((uint8_t)((address >> 8) & 0xffu), "ROTF AH");
     if (st != RPSW_OK) goto out;
 
-    for (size_t i = 0; i < len; i++) {
+    st = send_byte_read_ack_frame_labeled((uint8_t)(address & 0xffu), &data[0], "ROTF AL");
+    if (st != RPSW_OK) goto out;
+
+    for (size_t i = 1; i < len; i++) {
         st = recv_byte(&data[i]);
         if (st != RPSW_OK) goto out;
     }
@@ -203,17 +228,17 @@ rpsw_status_t swim_link_write(uint32_t address, const uint8_t *data, size_t len)
     uint32_t irq_state = save_and_disable_interrupts();
     rpsw_status_t st = send_command(SWIM_CMD_WOTF);
     if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)len);
+    st = send_byte_labeled((uint8_t)len, "WOTF len");
     if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)((address >> 16) & 0xffu));
+    st = send_byte_labeled((uint8_t)((address >> 16) & 0xffu), "WOTF AE");
     if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)((address >> 8) & 0xffu));
+    st = send_byte_labeled((uint8_t)((address >> 8) & 0xffu), "WOTF AH");
     if (st != RPSW_OK) goto out;
-    st = send_byte((uint8_t)(address & 0xffu));
+    st = send_byte_labeled((uint8_t)(address & 0xffu), "WOTF AL");
     if (st != RPSW_OK) goto out;
 
     for (size_t i = 0; i < len; i++) {
-        st = send_byte(data[i]);
+        st = send_byte_labeled(data[i], "WOTF data");
         if (st != RPSW_OK) goto out;
     }
 out:
