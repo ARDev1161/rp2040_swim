@@ -21,12 +21,25 @@ from protocol import Probe, ProtocolError, autodetect_port, list_serial_ports
 
 
 VOLTAGE_WARNING = "RP2040 GPIO is not 5V tolerant. Use 3.3V target or level shifter."
+STM8_FLASH_CR2 = 0x505B
+STM8_FLASH_NCR2 = 0x505C
 STM8_FLASH_IAPSR = 0x505F
 STM8_FLASH_PUKR = 0x5062
 STM8_FLASH_DUKR = 0x5064
+STM8_FLASH_CR2_OPT = 0x80
+STM8_FLASH_NCR2_NOPT = 0x80
 STM8_IAPSR_PUL = 0x02
+STM8_IAPSR_EOP = 0x04
 STM8_IAPSR_DUL = 0x08
+STM8_IAPSR_WR_PG_DIS = 0x01
 STM8_FLASH_ERASED_VALUE = 0x00
+STM8_ROP_ENABLED_VALUE = 0xAA
+STM8_ROP_DISABLED_VALUE = 0x00
+
+ROP_DESTRUCTIVE_WARNING = (
+    "ROP unprotect is destructive: it will mass erase program flash, "
+    "data EEPROM and option bytes."
+)
 
 ENTER_STAGE_NAMES = {
     0: "IDLE",
@@ -55,6 +68,14 @@ def open_probe(args: argparse.Namespace) -> Probe:
     return probe
 
 
+def read_u8(probe: Probe, address: int) -> int:
+    return probe.read_memory(address, 1)[0]
+
+
+def write_u8(probe: Probe, address: int, value: int) -> None:
+    probe.write_memory(address, bytes([value & 0xFF]))
+
+
 def write_key_pair_same_register(probe: Probe, key_reg: int, key1: int, key2: int) -> None:
     """Write STM8 FLASH key bytes as two byte writes to the same key register."""
     # PUKR/DUKR are key registers, not a two-byte memory window. A single
@@ -72,6 +93,84 @@ def wait_iapsr_mask(probe: Probe, mask: int, attempts: int = 100) -> int:
             return last_iapsr
         time.sleep(0.001)
     return last_iapsr
+
+
+def wait_flash_eop(probe: Probe, attempts: int = 250) -> int:
+    """Wait until STM8 reports end-of-programming for an EEPROM/option write."""
+    last_iapsr = 0
+    for _ in range(attempts):
+        last_iapsr = read_u8(probe, STM8_FLASH_IAPSR)
+        if last_iapsr & STM8_IAPSR_WR_PG_DIS:
+            raise ProtocolError(f"flash/option write rejected; IAPSR=0x{last_iapsr:02x}")
+        if last_iapsr & STM8_IAPSR_EOP:
+            return last_iapsr
+        time.sleep(0.001)
+    raise ProtocolError(f"timeout waiting for flash/option EOP; IAPSR=0x{last_iapsr:02x}")
+
+
+def unlock_data_eeprom(probe: Probe) -> int:
+    """Unlock STM8 data EEPROM / option-byte area."""
+    iapsr = read_u8(probe, STM8_FLASH_IAPSR)
+    if (iapsr & STM8_IAPSR_DUL) == STM8_IAPSR_DUL:
+        return iapsr
+    write_key_pair_same_register(probe, STM8_FLASH_DUKR, 0xAE, 0x56)
+    iapsr = wait_iapsr_mask(probe, STM8_IAPSR_DUL)
+    if (iapsr & STM8_IAPSR_DUL) != STM8_IAPSR_DUL:
+        raise ProtocolError(f"EEPROM/option unlock did not set DUL; IAPSR=0x{iapsr:02x}")
+    return iapsr
+
+
+def set_option_byte_programming(probe: Probe, enabled: bool) -> None:
+    """Enable/disable STM8 option-byte programming through FLASH_CR2/NCR2."""
+    cr2 = read_u8(probe, STM8_FLASH_CR2)
+    ncr2 = read_u8(probe, STM8_FLASH_NCR2)
+    if enabled:
+        cr2 |= STM8_FLASH_CR2_OPT
+        ncr2 &= ~STM8_FLASH_NCR2_NOPT
+    else:
+        cr2 &= ~STM8_FLASH_CR2_OPT
+        ncr2 |= STM8_FLASH_NCR2_NOPT
+    write_u8(probe, STM8_FLASH_CR2, cr2)
+    write_u8(probe, STM8_FLASH_NCR2, ncr2)
+
+
+def read_rop_byte(probe: Probe, device_name: str) -> int:
+    device = get_device(device_name)
+    return read_u8(probe, device.option_start)
+
+
+def rop_is_enabled(rop_byte: int) -> bool:
+    return (rop_byte & 0xFF) == STM8_ROP_ENABLED_VALUE
+
+
+def write_rop_byte(probe: Probe, device_name: str, value: int) -> int:
+    """Write STM8 OPT0/ROP byte and wait for the option write to complete."""
+    device = get_device(device_name)
+    unlock_data_eeprom(probe)
+    set_option_byte_programming(probe, True)
+    try:
+        write_u8(probe, device.option_start, value)
+        return wait_flash_eop(probe)
+    finally:
+        try:
+            set_option_byte_programming(probe, False)
+        except ProtocolError:
+            pass
+
+
+def reconnect_after_rop_change(probe: Probe, attempts: int = 12) -> None:
+    """Reset and re-enter SWIM after an ROP transition or destructive unprotect."""
+    last_error: Exception | None = None
+    for _ in range(attempts):
+        try:
+            probe.reset_target()
+            time.sleep(0.1)
+            probe.enter_swim()
+            return
+        except (OSError, ProtocolError) as exc:
+            last_error = exc
+            time.sleep(0.25)
+    raise ProtocolError(f"target did not reconnect after ROP change: {last_error}")
 
 
 def unlock_program_flash(probe: Probe) -> int:
@@ -176,6 +275,41 @@ def cmd_read(args: argparse.Namespace) -> int:
     Path(args.out).write_bytes(data)
     print(f"read {len(data)} bytes from 0x{args.addr:06x} to {args.out}")
     return 0
+
+
+def cmd_rop_status(args: argparse.Namespace) -> int:
+    print(VOLTAGE_WARNING, file=sys.stderr)
+    device = get_device(args.device)
+    with open_probe(args) as probe:
+        probe.enter_swim()
+        rop = read_rop_byte(probe, device.name)
+    enabled = rop_is_enabled(rop)
+    print(f"Device: {device.name}")
+    print(f"OPT0/ROP @ 0x{device.option_start:06x}: 0x{rop:02x}")
+    print(f"ROP: {'enabled' if enabled else 'disabled'}")
+    if enabled:
+        print("Program flash and data EEPROM readout are protected.")
+        print(ROP_DESTRUCTIVE_WARNING)
+    return 0
+
+
+def cmd_set_rop(args: argparse.Namespace) -> int:
+    print(
+        "error: set-rop is temporarily disabled. "
+        "The first hardware test produced an invalid option-byte state. "
+        "ROP writes must be reworked as a firmware-side atomic option-byte transaction.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_unprotect_rop(args: argparse.Namespace) -> int:
+    print(
+        "error: unprotect-rop is temporarily disabled. "
+        "ROP unprotect is destructive and option-byte programming is not validated yet.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def cmd_write_ram(args: argparse.Namespace) -> int:
@@ -288,6 +422,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--addr", type=parse_int, required=True)
     p.add_argument("--file", required=True)
     p.set_defaults(func=cmd_write_ram)
+
+    p = sub.add_parser("rop-status", help="read STM8 ROP/readout-protection status")
+    add_common(p)
+    p.add_argument("--device", choices=sorted(DEVICES), required=True)
+    p.set_defaults(func=cmd_rop_status)
+
+    p = sub.add_parser("set-rop", help="enable STM8 ROP/readout protection")
+    add_common(p)
+    p.add_argument("--device", choices=sorted(DEVICES), required=True)
+    p.add_argument("--yes-i-know", action="store_true", help="confirm that readout protection will be enabled")
+    p.set_defaults(func=cmd_set_rop)
+
+    p = sub.add_parser("unprotect-rop", help="disable STM8 ROP by destructive mass erase")
+    add_common(p)
+    p.add_argument("--device", choices=sorted(DEVICES), required=True)
+    p.add_argument("--yes-erase-all", action="store_true", help="confirm destructive mass erase")
+    p.set_defaults(func=cmd_unprotect_rop)
 
     p = sub.add_parser("flash", help="flash Intel HEX/IHX program")
     add_common(p)
