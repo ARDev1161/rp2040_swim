@@ -78,6 +78,8 @@ bool swim_phy_write_frame_bits_read_ack(uint32_t bits_msb_first, unsigned bit_co
                                         bool *ack);
 bool swim_phy_write_frame_bits_read_ack_and_frame(uint32_t bits, uint bit_count,
                                                   uint32_t timeout_us, uint32_t *rx_frame);
+bool swim_phy_write_bit_read_target_frame(bool ack, uint32_t timeout_us, uint32_t *rx_frame);
+bool swim_phy_read_target_frame(uint32_t timeout_us, uint32_t *rx_frame);
 bool swim_phy_read_frame_bits(uint32_t timeout_us, uint32_t *bits);
 bool swim_phy_read_bit(uint32_t timeout_us, bool *ok);
 bool swim_phy_wait_sync(uint32_t timeout_us);
@@ -91,5 +93,4 @@ void swim_phy_set_enter_stage(swim_enter_stage_t stage);
 void swim_phy_mark_enter_fail(void);
 void swim_phy_mark_second_sync_seen(void);
 void swim_phy_set_tx_context(const char *context);
-
 #endif

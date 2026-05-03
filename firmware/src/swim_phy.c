@@ -494,6 +494,14 @@ bool swim_phy_write_bit(bool bit) {
     if (g_phy.speed != SWIM_SPEED_LOW || !swim_phy_timing_ready()) {
         return false;
     }
+
+    /*
+     * This helper is used for immediate host ACK/NACK bits after target data
+     * frames. RX decode leaves the pad owned by PIO, while direct bit TX uses
+     * SIO open-drain control. Always switch the pad back to SIO first.
+     */
+    swim_phy_sio_input();
+
     uint32_t low_cycles = bit ? g_low_speed_one_low_cycles : g_low_speed_zero_low_cycles;
     uint32_t high_cycles = bit ? g_low_speed_one_high_cycles : g_low_speed_zero_high_cycles;
     swim_phy_sio_drive_low_fast();
@@ -617,23 +625,26 @@ static bool classify_low_width_ns(uint32_t low_ns, bool *bit) {
 
 #define SWIM_PHY_MAX_TX_FRAME_SEGMENTS 96u
 
-static bool build_tx_frame_segments(uint32_t bits,
-                                    uint bit_count,
-                                    swim_pio_tick_segment_t *segments,
-                                    size_t *segment_count) {
+static bool build_tx_frame_segments_ex(uint32_t bits,
+                                       uint bit_count,
+                                       bool include_leading_gap,
+                                       swim_pio_tick_segment_t *segments,
+                                       size_t *segment_count) {
     if (segments == NULL || segment_count == NULL || bit_count == 0u || bit_count > 32u) {
         return false;
     }
 
     size_t out = 0;
 
-    if (out + 1u > SWIM_PHY_MAX_TX_FRAME_SEGMENTS) {
-        return false;
+    if (include_leading_gap) {
+        if (out + 1u > SWIM_PHY_MAX_TX_FRAME_SEGMENTS) {
+            return false;
+        }
+        segments[out++] = (swim_pio_tick_segment_t){
+            .level = SWIM_SEG_RELEASE,
+            .duration_ticks = SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
+        };
     }
-    segments[out++] = (swim_pio_tick_segment_t){
-        .level = SWIM_SEG_RELEASE,
-        .duration_ticks = SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
-    };
 
     /*
      * Low-speed SWIM bit encoding:
@@ -672,6 +683,13 @@ static bool build_tx_frame_segments(uint32_t bits,
 
     *segment_count = out;
     return true;
+}
+
+static bool build_tx_frame_segments(uint32_t bits,
+                                    uint bit_count,
+                                    swim_pio_tick_segment_t *segments,
+                                    size_t *segment_count) {
+    return build_tx_frame_segments_ex(bits, bit_count, true, segments, segment_count);
 }
 
 #define SWIM_PHY_ACK_FRAME_SCAN_WIDTHS 48u
@@ -839,6 +857,164 @@ bool swim_phy_write_frame_bits_read_ack_and_frame(uint32_t bits,
              (unsigned long)(raw & 0x7ffu),
              (unsigned long)(rev & 0x7ffu));
     set_pio_debug(true, err);
+    return false;
+}
+
+static bool decode_target_frame_raw(uint32_t raw, uint32_t *frame_out);
+
+bool swim_phy_write_bit_read_target_frame(bool ack, uint32_t timeout_us, uint32_t *rx_frame) {
+    if (rx_frame == NULL || g_phy.speed != SWIM_SPEED_LOW ||
+        !swim_phy_timing_ready() || g_debug.derived_tswim_ns == 0u) {
+        return false;
+    }
+
+    /*
+     * Host ACK/NACK after a target data frame is a single SWIM bit, not a new
+     * host frame. Do not prepend SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS here.
+     * Arm RX before TX starts so the next target byte cannot be missed right
+     * after the ACK high-Z release.
+     */
+    swim_pio_tick_segment_t segments[SWIM_PHY_MAX_TX_FRAME_SEGMENTS];
+    size_t segment_count = 0;
+    if (!build_tx_frame_segments_ex(ack ? 1u : 0u, 1u, false, segments, &segment_count)) {
+        set_pio_debug(true, "bad ack bit frame");
+        return false;
+    }
+
+    uint64_t tick_hz64 =
+        (uint64_t)SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK * 1000000000ull /
+        (uint64_t)g_debug.derived_tswim_ns;
+    if (tick_hz64 == 0u || tick_hz64 > UINT32_MAX) {
+        set_pio_debug(true, "bad tick_hz for ack+rx");
+        return false;
+    }
+
+    uint32_t threshold_ns = g_debug.derived_tswim_ns * SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+    uint32_t threshold_loops = swim_pio_rx_ns_to_max_loops(threshold_ns);
+    if (threshold_loops == 0u) {
+        threshold_loops = 1u;
+    }
+
+    uint32_t raw = 0u;
+    rpsw_status_t st = swim_pio_emit_tick_segments_decode_bits(
+        segments,
+        segment_count,
+        (uint32_t)tick_hz64,
+        threshold_loops,
+        timeout_us,
+        10u,
+        &raw
+    );
+
+    swim_phy_sio_input();
+
+    if (st != RPSW_OK) {
+        char message[64];
+        snprintf(message, sizeof(message), "%s ack+target frame timeout",
+                 g_tx_context[0] != '\0' ? g_tx_context : "rx");
+        set_pio_debug(true, message);
+        return false;
+    }
+
+    uint32_t frame = 0u;
+    if (decode_target_frame_raw(raw, &frame)) {
+        *rx_frame = frame;
+        set_pio_debug(true, "ok");
+        return true;
+    }
+
+    uint32_t reversed = reverse_low_bits(raw, 10u);
+    if (decode_target_frame_raw(reversed, &frame)) {
+        *rx_frame = frame;
+        set_pio_debug(true, "ok rev");
+        return true;
+    }
+
+    char message[64];
+    snprintf(message, sizeof(message), "%s bad ack+target frame raw=0x%03lx",
+             g_tx_context[0] != '\0' ? g_tx_context : "rx",
+             (unsigned long)(raw & 0x3ffu));
+    set_pio_debug(true, message);
+    return false;
+}
+
+static bool decode_target_frame_raw(uint32_t raw, uint32_t *frame_out) {
+    if (frame_out == NULL) {
+        return false;
+    }
+
+    uint32_t frame = raw & 0x3ffu;
+    bool header = ((frame >> 9u) & 1u) != 0u;
+    if (!header) {
+        return false;
+    }
+
+    uint8_t value = (uint8_t)((frame >> 1u) & 0xffu);
+    bool parity = (frame & 1u) != 0u;
+    if (parity != swim_parity8(value)) {
+        return false;
+    }
+
+    *frame_out = frame;
+    return true;
+}
+
+bool swim_phy_read_target_frame(uint32_t timeout_us, uint32_t *rx_frame) {
+    if (rx_frame == NULL || g_phy.speed != SWIM_SPEED_LOW ||
+        !swim_phy_timing_ready() || g_debug.derived_tswim_ns == 0u) {
+        return false;
+    }
+
+    /*
+     * UM0470 target-to-host data frame:
+     *   header bit 1, eight data bits, parity bit.
+     *
+     * Do not receive this through the legacy per-bit width FIFO path. The high
+     * gaps for low-speed zero bits are only 2*Tswim, so pushing one FIFO word
+     * per bit can lose sync. Use the PIO decode program and push one raw word
+     * after all 10 bits are decoded.
+     */
+    uint32_t threshold_ns = g_debug.derived_tswim_ns * SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+    uint32_t threshold_loops = swim_pio_rx_ns_to_max_loops(threshold_ns);
+    if (threshold_loops == 0u) {
+        threshold_loops = 1u;
+    }
+
+    rpsw_status_t st = swim_pio_rx_arm_decode_bits_now(10u, threshold_loops);
+    if (st != RPSW_OK) {
+        set_pio_debug(true, "target frame arm failed");
+        return false;
+    }
+
+    uint32_t raw = 0;
+    st = swim_pio_rx_get_decoded_bits(timeout_us, 10u, &raw);
+    if (st != RPSW_OK) {
+        char message[64];
+        snprintf(message, sizeof(message), "%s target frame timeout",
+                 g_tx_context[0] != '\0' ? g_tx_context : "rx");
+        set_pio_debug(true, message);
+        return false;
+    }
+
+    uint32_t frame = 0;
+    if (decode_target_frame_raw(raw, &frame)) {
+        *rx_frame = frame;
+        set_pio_debug(true, "ok");
+        return true;
+    }
+
+    uint32_t reversed = reverse_low_bits(raw, 10u);
+    if (decode_target_frame_raw(reversed, &frame)) {
+        *rx_frame = frame;
+        set_pio_debug(true, "ok");
+        return true;
+    }
+
+    char message[64];
+    snprintf(message, sizeof(message), "%s bad target frame raw=0x%03lx",
+             g_tx_context[0] != '\0' ? g_tx_context : "rx",
+             (unsigned long)(raw & 0x3ffu));
+    set_pio_debug(true, message);
     return false;
 }
 

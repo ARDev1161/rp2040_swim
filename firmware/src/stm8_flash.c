@@ -28,9 +28,24 @@ static rpsw_status_t wait_iapsr_mask(uint8_t mask) {
     return RPSW_ERR_TARGET;
 }
 
+static rpsw_status_t write_key_pair_same_register(uint32_t key_reg, uint8_t key1, uint8_t key2) {
+    /*
+     * STM8 FLASH_PUKR/DUKR are key registers, not a two-byte memory window.
+     * The two key bytes must be written as two separate byte writes to the
+     * same register address. A multi-byte WOTF to key_reg would write the
+     * second byte to key_reg + 1 and the unlock sequence would be ignored.
+     */
+    rpsw_status_t st = stm8_dm_memory_write(key_reg, &key1, 1);
+    if (st != RPSW_OK) {
+        return st;
+    }
+    return stm8_dm_memory_write(key_reg, &key2, 1);
+}
+
 rpsw_status_t stm8_flash_unlock_program(void) {
-    const uint8_t keys[] = {STM8_PUKR_KEY1, STM8_PUKR_KEY2};
-    rpsw_status_t st = stm8_dm_memory_write(STM8_FLASH_PUKR, keys, sizeof(keys));
+    rpsw_status_t st = write_key_pair_same_register(STM8_FLASH_PUKR,
+                                                    STM8_PUKR_KEY1,
+                                                    STM8_PUKR_KEY2);
     if (st != RPSW_OK) {
         return st;
     }
@@ -38,8 +53,9 @@ rpsw_status_t stm8_flash_unlock_program(void) {
 }
 
 rpsw_status_t stm8_flash_unlock_eeprom(void) {
-    const uint8_t keys[] = {STM8_DUKR_KEY1, STM8_DUKR_KEY2};
-    rpsw_status_t st = stm8_dm_memory_write(STM8_FLASH_DUKR, keys, sizeof(keys));
+    rpsw_status_t st = write_key_pair_same_register(STM8_FLASH_DUKR,
+                                                    STM8_DUKR_KEY1,
+                                                    STM8_DUKR_KEY2);
     if (st != RPSW_OK) {
         return st;
     }

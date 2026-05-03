@@ -24,6 +24,8 @@ rpsw_status_t swim_pio_rx_arm_now(uint32_t max_loop_count);
 rpsw_status_t swim_pio_rx_arm_width_burst_after_tx_done(uint32_t count, uint32_t max_loop_count);
 rpsw_status_t swim_pio_rx_arm_decode_bits_after_tx_done(uint32_t bit_count,
                                                         uint32_t threshold_loop_count);
+rpsw_status_t swim_pio_rx_arm_decode_bits_now(uint32_t bit_count,
+                                              uint32_t threshold_loop_count);
 rpsw_status_t swim_pio_rx_get_decoded_bits(uint32_t timeout_us, uint32_t bit_count, uint32_t *bits);
 
 rpsw_status_t swim_pio_rx_get_width(swim_pio_rx_width_t *out, uint32_t timeout_us);

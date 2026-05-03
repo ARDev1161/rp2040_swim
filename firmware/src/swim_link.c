@@ -64,7 +64,7 @@ static rpsw_status_t send_byte_labeled(uint8_t byte, const char *label) {
     return ack ? RPSW_OK : RPSW_ERR_SWIM_NACK;
 }
 
-static rpsw_status_t decode_data_frame(uint32_t frame, uint8_t *byte) {
+static rpsw_status_t decode_data_frame_no_ack(uint32_t frame, uint8_t *byte) {
     bool header = ((frame >> 9u) & 1u) != 0u;
     if (!header) {
         return RPSW_ERR_TARGET;
@@ -73,23 +73,31 @@ static rpsw_status_t decode_data_frame(uint32_t frame, uint8_t *byte) {
     uint8_t value = (uint8_t)((frame >> 1u) & 0xffu);
     bool parity = (frame & 1u) != 0u;
     if (parity != swim_parity8(value)) {
-        (void)swim_phy_write_frame_bits(0u, 1);
         return RPSW_ERR_TARGET;
     }
 
-    if (!swim_phy_write_frame_bits(1u, 1)) {
-        return RPSW_ERR_SWIM_TIMEOUT;
-    }
     *byte = value;
     return RPSW_OK;
 }
 
-static rpsw_status_t recv_byte(uint8_t *byte) {
-    uint32_t frame = 0;
-    if (!swim_phy_read_frame_bits(SWIM_READ_TIMEOUT_US, &frame)) {
+static rpsw_status_t send_target_frame_ack(bool ack) {
+    if (!swim_phy_write_bit(ack)) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
-    return decode_data_frame(frame, byte);
+    return RPSW_OK;
+}
+
+static rpsw_status_t recv_byte_after_ack(uint8_t *byte) {
+    uint32_t frame = 0;
+    if (!swim_phy_write_bit_read_target_frame(true, SWIM_READ_TIMEOUT_US, &frame)) {
+        return RPSW_ERR_SWIM_TIMEOUT;
+    }
+
+    rpsw_status_t st = decode_data_frame_no_ack(frame, byte);
+    if (st != RPSW_OK) {
+        (void)send_target_frame_ack(false);
+    }
+    return st;
 }
 
 static rpsw_status_t send_byte_read_ack_frame_labeled(uint8_t byte, uint8_t *target_byte,
@@ -109,7 +117,11 @@ static rpsw_status_t send_byte_read_ack_frame_labeled(uint8_t byte, uint8_t *tar
         return RPSW_ERR_SWIM_TIMEOUT;
     }
 
-    return decode_data_frame(rx_frame, target_byte);
+    rpsw_status_t st = decode_data_frame_no_ack(rx_frame, target_byte);
+    if (st != RPSW_OK) {
+        (void)send_target_frame_ack(false);
+    }
+    return st;
 }
 
 rpsw_status_t swim_link_enter(void) {
@@ -206,10 +218,20 @@ rpsw_status_t swim_link_read(uint32_t address, uint8_t *data, size_t len) {
     st = send_byte_read_ack_frame_labeled((uint8_t)(address & 0xffu), &data[0], "ROTF AL");
     if (st != RPSW_OK) goto out;
 
+    /*
+     * The first target byte arrives immediately after the target ACKs AL. For
+     * multi-byte ROTF, each following byte is released by a host ACK to the
+     * previous data frame. That ACK must be a single immediate SWIM bit; using
+     * a normal TX frame with an interframe gap can make real STM8S targets stop
+     * after the first byte.
+     */
     for (size_t i = 1; i < len; i++) {
-        st = recv_byte(&data[i]);
+        st = recv_byte_after_ack(&data[i]);
         if (st != RPSW_OK) goto out;
     }
+
+    st = send_target_frame_ack(true);
+    if (st != RPSW_OK) goto out;
 out:
     restore_interrupts(irq_state);
     return st;

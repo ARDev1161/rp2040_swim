@@ -434,6 +434,25 @@ rpsw_status_t swim_pio_rx_arm_decode_bits_after_tx_done(uint32_t bit_count,
     return RPSW_OK;
 }
 
+rpsw_status_t swim_pio_rx_arm_decode_bits_now(uint32_t bit_count,
+                                              uint32_t threshold_loop_count) {
+    rpsw_status_t st = swim_pio_rx_arm_decode_bits_after_tx_done(
+        bit_count,
+        threshold_loop_count
+    );
+    if (st != RPSW_OK) {
+        return st;
+    }
+
+    /*
+     * The decode PIO program waits for IRQ0 before waiting for the first
+     * target bit. For standalone target-frame reads after a previous host ACK
+     * there is no preceding TX waveform, so wake it explicitly.
+     */
+    pio_sm_exec(g_rx_pio, g_rx_sm, pio_encode_irq_set(false, 0));
+    return RPSW_OK;
+}
+
 rpsw_status_t swim_pio_rx_get_decoded_bits(uint32_t timeout_us, uint32_t bit_count, uint32_t *bits) {
     if (bits == NULL || bit_count == 0u || bit_count > 31u) {
         return RPSW_ERR_BAD_ARGUMENT;
