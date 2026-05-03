@@ -133,42 +133,35 @@ def test_read_bit_uses_pio_rx_width_capture() -> None:
     assert "width.low_ns" in function
 
 
-def test_recv_byte_uses_single_pio_frame_capture() -> None:
+def test_recv_byte_after_ack_uses_immediate_ack_target_frame_capture() -> None:
     link_source = (REPO_ROOT / "firmware/src/swim_link.c").read_text()
-    recv = link_source[link_source.index("static rpsw_status_t recv_byte"):]
-    recv = recv[:recv.index("rpsw_status_t swim_link_enter")]
-    assert "swim_phy_read_frame_bits" in recv
-    assert "for (unsigned bit" not in recv
-    phy_source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
-    assert "swim_pio_rx_frame10" in phy_source
-    cmake = (REPO_ROOT / "firmware/CMakeLists.txt").read_text()
-    assert "pio/swim_rx_width.pio" in cmake
+    recv = link_source[link_source.index("static rpsw_status_t recv_byte_after_ack"):]
+    recv = recv[:recv.index("static rpsw_status_t send_byte_read_ack_frame_labeled")]
+    assert "swim_phy_write_bit_read_target_frame(true, SWIM_READ_TIMEOUT_US, &frame)" in recv
+    assert "decode_data_frame_no_ack(frame, byte)" in recv
+    assert "send_target_frame_ack(false)" in recv
 
 
-def test_rotf_first_data_byte_captured_with_final_address_ack() -> None:
+def test_rotf_captures_first_data_byte_with_final_address_ack() -> None:
     source = (REPO_ROOT / "firmware/src/swim_link.c").read_text()
     read_fn = source[source.index("rpsw_status_t swim_link_read"):]
     read_fn = read_fn[:read_fn.index("rpsw_status_t swim_link_write")]
     assert "send_byte_read_ack_frame_labeled((uint8_t)(address & 0xffu), &data[0], \"ROTF AL\")" in read_fn
     assert "for (size_t i = 1; i < len; i++)" in read_fn
-    phy = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
-    assert "swim_pio_emit_tick_segments_capture_ack_frame" in phy
-    cmake = (REPO_ROOT / "firmware/CMakeLists.txt").read_text()
-    assert "pio/swim_rx_ack_frame.pio" not in cmake
+    assert "recv_byte_after_ack(&data[i])" in read_fn
+    assert "single immediate SWIM bit" in read_fn
+    assert "send_target_frame_ack(true)" in read_fn
 
 
-def test_pio_programs_fit_single_pio_instruction_memory() -> None:
-    rx = (REPO_ROOT / "firmware/pio/swim_rx_width.pio").read_text()
-    assert "The combined program is deliberately 18 instructions" in rx
-    cmake = (REPO_ROOT / "firmware/CMakeLists.txt").read_text()
-    assert "pio/swim_rx_frame.pio" not in cmake
-    assert "pio/swim_rx_ack_frame.pio" not in cmake
-
-
-def test_pio_rx_normalizes_shifted_frame_bits() -> None:
+def test_pio_rx_switches_between_width_and_decode_programs() -> None:
     source = (REPO_ROOT / "firmware/src/swim_pio_rx.c").read_text()
-    assert "normalize_shifted_bits" in source
-    assert "raw >> (32u - bit_count)" in source
+    assert '#include "swim_rx_width.pio.h"' in source
+    assert '#include "swim_rx_decode.pio.h"' in source
+    assert "SWIM_RX_PROGRAM_WIDTH" in source
+    assert "SWIM_RX_PROGRAM_DECODE" in source
+    assert "switch_rx_program" in source
+    assert "configure_width_sms" in source
+    assert "configure_decode_sm" in source
 
 
 def test_entry_waveform_command_exists() -> None:
@@ -229,14 +222,55 @@ def test_pio_waveform_is_open_drain_and_deterministic() -> None:
     assert "pio_sm_set_pindirs_with_mask" in c_source
     assert "pio_gpio_init(g_pio.pio, g_pio.swim_pin)" in c_source
     assert "#define SWIM_PIO_TICKS_PER_US 10u" in c_source
-    assert "#define SWIM_PIO_SEGMENT_OVERHEAD_TICKS 8u" in c_source
+    assert "SWIM_PIO_SEGMENT_OVERHEAD_TICKS" in c_source
     assert "pio_interrupt_get" in c_source
 
 
-def test_flash_guards_remain_enabled() -> None:
+def test_flash_erase_and_write_mvp_is_enabled() -> None:
     source = (REPO_ROOT / "firmware/src/stm8_flash.c").read_text()
-    assert "RPSW_ERR_FLASH_GUARD" in source
-    assert source.count("RPSW_ERR_FLASH_GUARD") >= 2
+    header = (REPO_ROOT / "firmware/src/stm8_flash.h").read_text()
+    assert "RPSW_ERR_FLASH_GUARD" not in source
+    assert "const char *stm8_flash_last_error(void)" in header
+    assert "g_flash_last_error" in source
+    assert "#define STM8_FLASH_BLOCK_SIZE   64u" in source
+    assert "#define STM8_FLASH_ERASED_VALUE 0x00u" in source
+    assert "#define STM8_CR2_ERASE   0x20u" in source
+    assert "stm8_dm_memory_write(block, erase_block, STM8_FLASH_BLOCK_SIZE)" in source
+    assert "st == RPSW_ERR_SWIM_TIMEOUT || st == RPSW_ERR_SWIM_NACK" in source
+    assert "flash_busy_delay_and_resync(30000u)" in source
+    assert "Use conservative byte programming for the MVP" in source
+
+
+def test_flash_commands_report_detailed_firmware_errors() -> None:
+    main_source = (REPO_ROOT / "firmware/src/main.c").read_text()
+    protocol_source = (REPO_ROOT / "host/protocol.py").read_text()
+    assert "stm8_flash_last_error()" in main_source
+    assert "snprintf(g_last_error, sizeof(g_last_error), \"%s: %s\"" in main_source
+    assert "self.command(Command.GET_LAST_ERROR).decode" in protocol_source
+    assert "suffix = f\": {detail}\" if detail else \"\"" in protocol_source
+
+
+def test_flash_write_block_payload_length_is_validated() -> None:
+    source = (REPO_ROOT / "firmware/src/main.c").read_text()
+    write_case = source[source.index("case CMD_FLASH_WRITE_BLOCK") : source.index("case CMD_FLASH_VERIFY")]
+    assert "uint16_t len = rpsw_get_u16le(&request->payload[4]);" in write_case
+    assert "request->length != (uint16_t)(6u + len)" in write_case
+    assert "return RPSW_ERR_BAD_ARGUMENT;" in write_case
+
+
+def test_host_unlock_writes_keys_as_two_single_byte_transactions() -> None:
+    source = (REPO_ROOT / "host/rp2040_swim.py").read_text()
+    helper = source[source.index("def write_key_pair_same_register") : source.index("def wait_iapsr_mask")]
+    assert "probe.write_memory(key_reg, bytes([key1]))" in helper
+    assert "probe.write_memory(key_reg, bytes([key2]))" in helper
+    assert "bytes([key1, key2])" not in helper
+    assert "unlock_program_flash(probe)" in source
+    assert "fill=STM8_FLASH_ERASED_VALUE" in source
+
+
+def test_host_protocol_uses_long_timeout_for_full_flash_erase() -> None:
+    source = (REPO_ROOT / "host/protocol.py").read_text()
+    assert "timeout: float = 15.0" in source
 
 
 def test_high_speed_remains_disabled() -> None:
