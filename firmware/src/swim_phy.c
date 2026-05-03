@@ -9,6 +9,7 @@
 #include "pico/stdlib.h"
 #include "swim_pio_waveform.h"
 #include "swim_sync_limits.h"
+#include "swim_bits.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -626,6 +627,14 @@ static bool build_tx_frame_segments(uint32_t bits,
 
     size_t out = 0;
 
+    if (out + 1u > SWIM_PHY_MAX_TX_FRAME_SEGMENTS) {
+        return false;
+    }
+    segments[out++] = (swim_pio_tick_segment_t){
+        .level = SWIM_SEG_RELEASE,
+        .duration_ticks = SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
+    };
+
     /*
      * Low-speed SWIM bit encoding:
      *   bit 1: LOW  2*Tswim, HIGH 20*Tswim
@@ -665,6 +674,84 @@ static bool build_tx_frame_segments(uint32_t bits,
     return true;
 }
 
+#define SWIM_PHY_ACK_FRAME_SCAN_WIDTHS 48u
+#define SWIM_PHY_RESPONSE_GAP_TIMEOUT_US 5000u
+
+static bool decode_target_frame_from_widths(const swim_pio_rx_width_t *widths,
+                                            uint32_t start_index,
+                                            uint32_t *frame_out) {
+    if (widths == NULL || frame_out == NULL) {
+        return false;
+    }
+
+    uint32_t frame = 0;
+
+    for (uint32_t i = 0; i < 10u; ++i) {
+        bool bit = false;
+        if (!classify_low_width_ns(widths[start_index + i].low_ns, &bit)) {
+            return false;
+        }
+
+        frame = (frame << 1u) | (bit ? 1u : 0u);
+    }
+
+    /*
+     * Expected target data frame layout:
+     *   header/start bit = 1
+     *   8 data bits
+     *   parity bit
+     */
+    bool header = ((frame >> 9u) & 1u) != 0u;
+    if (!header) {
+        return false;
+    }
+
+    uint8_t value = (uint8_t)((frame >> 1u) & 0xffu);
+    bool parity = (frame & 1u) != 0u;
+
+    if (parity != swim_parity8(value)) {
+        return false;
+    }
+
+    *frame_out = frame;
+    return true;
+}
+
+static uint32_t reverse_low_bits(uint32_t value, uint32_t bit_count) {
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < bit_count; ++i) {
+        out = (out << 1u) | (value & 1u);
+        value >>= 1u;
+    }
+    return out;
+}
+
+static bool decode_ack_frame_raw(uint32_t raw, uint32_t *frame_out) {
+    if (frame_out == NULL) {
+        return false;
+    }
+
+    bool ack = ((raw >> 10u) & 1u) != 0u;
+    if (!ack) {
+        return false;
+    }
+
+    uint32_t frame = raw & 0x3ffu;
+    bool header = ((frame >> 9u) & 1u) != 0u;
+    if (!header) {
+        return false;
+    }
+
+    uint8_t value = (uint8_t)((frame >> 1u) & 0xffu);
+    bool parity = (frame & 1u) != 0u;
+    if (parity != swim_parity8(value)) {
+        return false;
+    }
+
+    *frame_out = frame;
+    return true;
+}
+
 bool swim_phy_write_frame_bits_read_ack_and_frame(uint32_t bits,
                                                   uint bit_count,
                                                   uint32_t timeout_us,
@@ -683,72 +770,76 @@ bool swim_phy_write_frame_bits_read_ack_and_frame(uint32_t bits,
     }
 
     uint64_t tick_hz64 =
-    (uint64_t)SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK * 1000000000ull /
-    (uint64_t)g_debug.derived_tswim_ns;
+        (uint64_t)SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK * 1000000000ull /
+        (uint64_t)g_debug.derived_tswim_ns;
     if (tick_hz64 == 0u || tick_hz64 > UINT32_MAX) {
         set_pio_debug(true, "bad tick_hz for ack+frame");
         return false;
     }
 
     /*
-     * ACK + 10-bit data frame = 11 low-width captures.
+     * UM0470 receive after the last ROTF address byte:                    *
+     *   target ACK bit + target 10-bit data frame.
+     *
+     * Decode this in PIO as one state-machine transaction. The previous
+     * low-width stream mode pushed after every bit and could lose sync on the
+     * short 2*Tswim HIGH gaps. This path pushes only one decoded raw word.
      */
-    swim_pio_rx_width_t widths[SWIM_PIO_RX_ACK_FRAME_WIDTHS] = {0};
 
-    uint32_t max_ns = g_debug.derived_tswim_ns * 80u;
-    if (max_ns < 10000u) {
-        max_ns = 10000u;
+    uint32_t threshold_ns = g_debug.derived_tswim_ns * SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+    uint32_t threshold_loops = swim_pio_rx_ns_to_max_loops(threshold_ns);
+    if (threshold_loops == 0u) {
+        threshold_loops = 1u;
     }
-    uint32_t max_loops = swim_pio_rx_ns_to_max_loops(max_ns);
 
-    rpsw_status_t st = swim_pio_emit_tick_segments_capture_width_burst(
+    uint32_t raw = 0;
+    uint32_t rx_timeout_us = timeout_us;
+    if (rx_timeout_us < 2000u) {
+        rx_timeout_us = 2000u;
+    }
+
+    rpsw_status_t st = swim_pio_emit_tick_segments_decode_bits(
         segments,
         segment_count,
         (uint32_t)tick_hz64,
-        max_loops,
-        timeout_us,
-        widths,
-        SWIM_PIO_RX_ACK_FRAME_WIDTHS
+        threshold_loops,
+        rx_timeout_us,
+        11u,
+        &raw
     );
 
     swim_phy_sio_input();
 
     if (st != RPSW_OK) {
-        static char err[128];
-
-        snprintf(err, sizeof(err),
-                 "burst timeout cap=%lu/%lu idx=%lu first=%lu,%lu,%lu,%lu us",
-                 (unsigned long)swim_pio_rx_burst_captured_count(),
-                 (unsigned long)swim_pio_rx_burst_requested_count(),
-                 (unsigned long)swim_pio_rx_burst_timeout_index(),
-                 (unsigned long)swim_pio_rx_burst_first_low_us(0),
-                 (unsigned long)swim_pio_rx_burst_first_low_us(1),
-                 (unsigned long)swim_pio_rx_burst_first_low_us(2),
-                 (unsigned long)swim_pio_rx_burst_first_low_us(3));
-
+        static char err[96];
+        snprintf(err, sizeof(err), "ackfrm timeout %s raw=0x%03lx",
+                 g_tx_context[0] != '\0' ? g_tx_context : "tx",
+                 (unsigned long)raw);
         set_pio_debug(true, err);
         return false;
     }
 
-    bool ack = false;
-    if (!classify_low_width_ns(widths[0].low_ns, &ack) || !ack) {
-        set_pio_debug(true, "PIO RX ACK before frame invalid");
-        return false;
-    }
-
     uint32_t frame = 0;
-    for (uint32_t i = 1u; i < SWIM_PIO_RX_ACK_FRAME_WIDTHS; ++i) {
-        bool bit = false;
-        if (!classify_low_width_ns(widths[i].low_ns, &bit)) {
-            set_pio_debug(true, "PIO RX frame width ambiguous");
-            return false;
-        }
-        frame = (frame << 1u) | (bit ? 1u : 0u);
+    if (decode_ack_frame_raw(raw, &frame)) {
+        *rx_frame = frame;
+        set_pio_debug(true, "ok");
+        return true;
     }
 
-    *rx_frame = frame;
-    set_pio_debug(true, "ok");
-    return true;
+    uint32_t rev = reverse_low_bits(raw, 11u);
+    if (decode_ack_frame_raw(rev, &frame)) {
+        *rx_frame = frame;
+        set_pio_debug(true, "ok rev");
+        return true;
+    }
+
+    static char err[96];
+    snprintf(err, sizeof(err), "bad ackfrm %s raw=0x%03lx rev=0x%03lx",
+             g_tx_context[0] != '\0' ? g_tx_context : "tx",
+             (unsigned long)(raw & 0x7ffu),
+             (unsigned long)(rev & 0x7ffu));
+    set_pio_debug(true, err);
+    return false;
 }
 
 bool swim_phy_read_frame_bits(uint32_t timeout_us, uint32_t *bits) {

@@ -30,6 +30,7 @@ add_executable(rp2040_swim
 
 pico_generate_pio_header(rp2040_swim ${CMAKE_CURRENT_LIST_DIR}/pio/swim_waveform.pio)
 pico_generate_pio_header(rp2040_swim ${CMAKE_CURRENT_LIST_DIR}/pio/swim_rx_width.pio)
+pico_generate_pio_header(rp2040_swim ${CMAKE_CURRENT_LIST_DIR}/pio/swim_rx_decode.pio)
 
 target_include_directories(rp2040_swim PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src

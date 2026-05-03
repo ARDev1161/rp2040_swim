@@ -1,0 +1,41 @@
+.program swim_rx_decode
+
+; Decode a fixed number of SWIM low-speed bits without pushing per bit.
+;
+; C pushes:
+;   1) count_minus_1
+;   2) threshold_loop_count
+;
+; The program waits for PIO IRQ0 from the TX waveform engine, then decodes
+; each bit by measuring whether LOW returns high before threshold expires.
+; Bits are shifted MSB-first and one raw word is pushed at the end.
+
+.wrap_target
+start:
+    pull block
+    mov y, osr
+    pull block
+    wait 1 irq 0
+    mov isr, null
+
+bit_start:
+    mov x, osr
+    wait 0 pin 0
+low_loop:
+    jmp pin bit_one
+    jmp x-- low_loop
+
+bit_zero:
+    wait 1 pin 0
+    in null, 1
+    jmp bit_done
+
+bit_one:
+    set x, 1
+    wait 1 pin 0
+    in x, 1
+
+bit_done:
+    jmp y-- bit_start
+    push block
+.wrap

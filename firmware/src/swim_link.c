@@ -2,6 +2,7 @@
 
 #include "hardware/sync.h"
 #include "swim_phy.h"
+#include "swim_bits.h"
 #include "pico/stdlib.h"
 
 #define SWIM_CMD_SRST 0x0u
@@ -17,13 +18,6 @@
 
 static bool parity3(uint8_t v) {
     return ((v ^ (v >> 1) ^ (v >> 2)) & 1u) != 0u;
-}
-
-static bool parity8(uint8_t v) {
-    v ^= (uint8_t)(v >> 4);
-    v ^= (uint8_t)(v >> 2);
-    v ^= (uint8_t)(v >> 1);
-    return (v & 1u) != 0u;
 }
 
 static rpsw_status_t read_ack(void) {
@@ -62,7 +56,7 @@ static rpsw_status_t send_byte_labeled(uint8_t byte, const char *label) {
         return RPSW_ERR_SWIM_TIMEOUT;
     }
     swim_phy_set_tx_context(label);
-    uint32_t frame = ((uint32_t)byte << 1u) | (parity8(byte) ? 1u : 0u);
+    uint32_t frame = ((uint32_t)byte << 1u) | (swim_parity8(byte) ? 1u : 0u);
     bool ack = false;
     if (!swim_phy_write_frame_bits_read_ack(frame, 10, SWIM_ACK_TIMEOUT_US, &ack)) {
         return RPSW_ERR_SWIM_TIMEOUT;
@@ -78,7 +72,7 @@ static rpsw_status_t decode_data_frame(uint32_t frame, uint8_t *byte) {
 
     uint8_t value = (uint8_t)((frame >> 1u) & 0xffu);
     bool parity = (frame & 1u) != 0u;
-    if (parity != parity8(value)) {
+    if (parity != swim_parity8(value)) {
         (void)swim_phy_write_frame_bits(0u, 1);
         return RPSW_ERR_TARGET;
     }
@@ -106,7 +100,7 @@ static rpsw_status_t send_byte_read_ack_frame_labeled(uint8_t byte, uint8_t *tar
 
     swim_phy_set_tx_context(label);
 
-    uint32_t tx_frame = ((uint32_t)byte << 1u) | (parity8(byte) ? 1u : 0u);
+    uint32_t tx_frame = ((uint32_t)byte << 1u) | (swim_parity8(byte) ? 1u : 0u);
     uint32_t rx_frame = 0;
 
     if (!swim_phy_write_frame_bits_read_ack_and_frame(tx_frame, 10u,

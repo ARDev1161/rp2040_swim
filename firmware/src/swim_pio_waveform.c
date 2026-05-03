@@ -655,21 +655,30 @@ rpsw_status_t swim_pio_emit_tick_segments_capture_response(
     return RPSW_OK;
 }
 
-rpsw_status_t swim_pio_emit_tick_segments_capture_width_burst(
+static rpsw_status_t emit_tick_segments_capture_width_burst_common(
     const swim_pio_tick_segment_t *segments,
     size_t count,
     uint32_t tick_hz,
     uint32_t rx_max_loops,
     uint32_t timeout_us,
     swim_pio_rx_width_t *widths,
-    uint32_t width_count
+    uint32_t width_count,
+    uint32_t *captured_count,
+    bool partial
 ) {
     if (widths == NULL || width_count == 0u) {
+        return RPSW_ERR_BAD_ARGUMENT;
+    }
+    if (partial && captured_count == NULL) {
         return RPSW_ERR_BAD_ARGUMENT;
     }
     if (!g_pio.initialized || tick_hz == 0u) {
         set_error("PIO waveform engine not initialized");
         return RPSW_ERR_INTERNAL;
+    }
+
+    if (captured_count != NULL) {
+        *captured_count = 0u;
     }
 
     uint32_t commands[SWIM_PIO_MAX_SEGMENTS + 1u];
@@ -704,9 +713,23 @@ rpsw_status_t swim_pio_emit_tick_segments_capture_width_burst(
 
     dma_channel_start(g_pio.dma_channel);
     pio_sm_set_enabled(g_pio.pio, g_pio.sm, true);
-    dma_channel_wait_for_finish_blocking(g_pio.dma_channel);
 
-    st = swim_pio_rx_get_width_burst(widths, width_count, timeout_us);
+    /*
+     * Critical for UM0470 target response:
+     * RX FIFO must be drained while the response is happening. If we wait for TX
+     * DMA completion first, the RX FIFO can fill and the RX SM blocks on push.
+     */
+    if (partial) {
+        st = swim_pio_rx_get_width_burst_partial(widths, width_count,
+                                                 timeout_us, captured_count);
+    } else {
+        st = swim_pio_rx_get_width_burst(widths, width_count, timeout_us);
+        if (st == RPSW_OK && captured_count != NULL) {
+            *captured_count = width_count;
+        }
+    }
+
+    dma_channel_wait_for_finish_blocking(g_pio.dma_channel);
 
     pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
     pio_release_swim_pin();
@@ -716,7 +739,128 @@ rpsw_status_t swim_pio_emit_tick_segments_capture_width_burst(
     }
 
     if (st != RPSW_OK) {
-        set_error("PIO RX width-burst timeout");
+        set_error(partial ? "PIO RX width-burst partial timeout"
+        : "PIO RX width-burst timeout");
+        return st;
+    }
+
+    set_error("ok");
+    return RPSW_OK;
+}
+
+rpsw_status_t swim_pio_emit_tick_segments_capture_width_burst(
+    const swim_pio_tick_segment_t *segments,
+    size_t count,
+    uint32_t tick_hz,
+    uint32_t rx_max_loops,
+    uint32_t timeout_us,
+    swim_pio_rx_width_t *widths,
+    uint32_t width_count
+) {
+    return emit_tick_segments_capture_width_burst_common(
+        segments,
+        count,
+        tick_hz,
+        rx_max_loops,
+        timeout_us,
+        widths,
+        width_count,
+        NULL,
+        false
+    );
+}
+
+rpsw_status_t swim_pio_emit_tick_segments_capture_width_burst_partial(
+    const swim_pio_tick_segment_t *segments,
+    size_t count,
+    uint32_t tick_hz,
+    uint32_t rx_max_loops,
+    uint32_t timeout_us,
+    swim_pio_rx_width_t *widths,
+    uint32_t max_width_count,
+    uint32_t *captured_count
+) {
+    return emit_tick_segments_capture_width_burst_common(
+        segments,
+        count,
+        tick_hz,
+        rx_max_loops,
+        timeout_us,
+        widths,
+        max_width_count,
+        captured_count,
+        true
+    );
+}
+
+rpsw_status_t swim_pio_emit_tick_segments_decode_bits(
+    const swim_pio_tick_segment_t *segments,
+    size_t count,
+    uint32_t tick_hz,
+    uint32_t threshold_loops,
+    uint32_t timeout_us,
+    uint32_t bit_count,
+    uint32_t *bits
+) {
+    if (bits == NULL || bit_count == 0u || bit_count > 31u) {
+        return RPSW_ERR_BAD_ARGUMENT;
+    }
+    if (!g_pio.initialized || tick_hz == 0u) {
+        set_error("PIO waveform engine not initialized");
+        return RPSW_ERR_INTERNAL;
+    }
+
+    uint32_t commands[SWIM_PIO_MAX_SEGMENTS + 1u];
+    uint32_t total_ticks = 0;
+    rpsw_status_t st = encode_tick_segments(segments, count, commands, &total_ticks);
+    if (st != RPSW_OK) {
+        set_error("bad tick segment list");
+        return st;
+    }
+    commands[count] = 0u;
+
+    st = swim_pio_rx_arm_decode_bits_after_tx_done(bit_count, threshold_loops);
+    if (st != RPSW_OK) {
+        set_error("PIO RX decode arm failed");
+        return st;
+    }
+
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_sm_clear_fifos(g_pio.pio, g_pio.sm);
+    restart_tx_sm_at_program_start();
+    pio_gpio_init(g_pio.pio, g_pio.swim_pin);
+    set_pio_tick_hz(tick_hz);
+    pio_release_swim_pin();
+
+    dma_channel_config dma_config = dma_channel_get_default_config(g_pio.dma_channel);
+    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
+    channel_config_set_read_increment(&dma_config, true);
+    channel_config_set_write_increment(&dma_config, false);
+    channel_config_set_dreq(&dma_config, pio_get_dreq(g_pio.pio, g_pio.sm, true));
+    dma_channel_configure(g_pio.dma_channel, &dma_config,
+                          &g_pio.pio->txf[g_pio.sm], commands, count + 1u, false);
+
+    dma_channel_start(g_pio.dma_channel);
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, true);
+
+    /*
+     * RX decode is armed before TX starts. It wakes on TX sentinel IRQ0 after
+     * SWIM is released and then decodes the target response without per-bit
+     * FIFO traffic.
+     */
+    st = swim_pio_rx_get_decoded_bits(timeout_us, bit_count, bits);
+
+    dma_channel_wait_for_finish_blocking(g_pio.dma_channel);
+
+    pio_sm_set_enabled(g_pio.pio, g_pio.sm, false);
+    pio_release_swim_pin();
+
+    if (dma_channel_is_busy(g_pio.dma_channel)) {
+        dma_channel_abort(g_pio.dma_channel);
+    }
+
+    if (st != RPSW_OK) {
+        set_error("PIO RX decode timeout");
         return st;
     }
 

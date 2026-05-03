@@ -51,6 +51,14 @@ rpsw_status_t swim_pio_emit_tick_segments_capture_width_burst(const swim_pio_tic
                                                               size_t count, uint32_t tick_hz,
                                                               uint32_t rx_max_loops, uint32_t timeout_us,
                                                               swim_pio_rx_width_t *widths, uint32_t width_count);
+rpsw_status_t swim_pio_emit_tick_segments_capture_width_burst_partial(const swim_pio_tick_segment_t *segments,
+                                                                      size_t count, uint32_t tick_hz, uint32_t rx_max_loops,
+                                                                      uint32_t timeout_us, swim_pio_rx_width_t *widths,
+                                                                      uint32_t max_width_count, uint32_t *captured_count);
+rpsw_status_t swim_pio_emit_tick_segments_decode_bits(const swim_pio_tick_segment_t *segments,
+                                                       size_t count, uint32_t tick_hz,
+                                                       uint32_t threshold_loops, uint32_t timeout_us,
+                                                       uint32_t bit_count, uint32_t *bits);
 rpsw_status_t swim_pio_emit_segments_wait_sync(const swim_segment_t *segments, size_t count,
                                                uint32_t timeout_us,
                                                swim_pio_sync_measurement_t *measurement);
