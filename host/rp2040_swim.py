@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from devices import DEVICES, get_device
@@ -52,6 +53,23 @@ def open_probe(args: argparse.Namespace) -> Probe:
     probe.set_speed(args.high_speed)
     return probe
 
+def write_key_pair_same_register(probe: Probe, key_reg: int, key1: int, key2: int) -> None:
+    """Write STM8 FLASH key bytes as two byte writes to the same key register."""
+    # PUKR/DUKR are key registers, not a two-byte memory window. A single
+    # multi-byte MEMORY_WRITE to key_reg would store key2 at key_reg + 1 and
+    # the STM8 MASS unlock sequence would be ignored.
+    probe.write_memory(key_reg, bytes([key1]))
+    probe.write_memory(key_reg, bytes([key2]))
+
+
+def wait_iapsr_mask(probe: Probe, mask: int, attempts: int = 100) -> int:
+    last_iapsr = 0
+    for _ in range(attempts):
+        last_iapsr = probe.read_memory(STM8_FLASH_IAPSR, 1)[0]
+        if (last_iapsr & mask) == mask:
+            return last_iapsr
+        time.sleep(0.001)
+    return last_iapsr
 
 def cmd_list(_args: argparse.Namespace) -> int:
     for port in list_serial_ports():
@@ -164,17 +182,17 @@ def cmd_unlock(args: argparse.Namespace) -> int:
     with open_probe(args) as probe:
         probe.enter_swim()
         if args.flash:
-            probe.write_memory(STM8_FLASH_PUKR, bytes([0x56, 0xAE]))
+            write_key_pair_same_register(probe, STM8_FLASH_PUKR, 0x56, 0xAE)
             mask = STM8_IAPSR_PUL
             area = "flash"
         else:
-            probe.write_memory(STM8_FLASH_DUKR, bytes([0xAE, 0x56]))
+            write_key_pair_same_register(probe, STM8_FLASH_DUKR, 0xAE, 0x56)
             mask = STM8_IAPSR_DUL
             area = "EEPROM"
-        iapsr = probe.read_memory(STM8_FLASH_IAPSR, 1)[0]
+        iapsr = wait_iapsr_mask(probe, mask)
         if (iapsr & mask) != mask:
             raise ProtocolError(f"{area} unlock did not set IAPSR bit; IAPSR=0x{iapsr:02x}")
-    print(f"unlocked {area} on {args.device}")
+    print(f"unlocked {area} on {args.device}; IAPSR=0x{iapsr:02x}")
     return 0
 
 
