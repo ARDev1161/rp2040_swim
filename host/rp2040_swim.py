@@ -26,6 +26,7 @@ STM8_FLASH_PUKR = 0x5062
 STM8_FLASH_DUKR = 0x5064
 STM8_IAPSR_PUL = 0x02
 STM8_IAPSR_DUL = 0x08
+STM8_FLASH_ERASED_VALUE = 0x00
 
 ENTER_STAGE_NAMES = {
     0: "IDLE",
@@ -53,6 +54,7 @@ def open_probe(args: argparse.Namespace) -> Probe:
     probe.set_speed(args.high_speed)
     return probe
 
+
 def write_key_pair_same_register(probe: Probe, key_reg: int, key1: int, key2: int) -> None:
     """Write STM8 FLASH key bytes as two byte writes to the same key register."""
     # PUKR/DUKR are key registers, not a two-byte memory window. A single
@@ -70,6 +72,16 @@ def wait_iapsr_mask(probe: Probe, mask: int, attempts: int = 100) -> int:
             return last_iapsr
         time.sleep(0.001)
     return last_iapsr
+
+
+def unlock_program_flash(probe: Probe) -> int:
+    """Unlock STM8 program flash using the validated host-side key sequence."""
+    iapsr = probe.read_memory(STM8_FLASH_IAPSR, 1)[0]
+    if (iapsr & STM8_IAPSR_PUL) == STM8_IAPSR_PUL:
+        return iapsr
+    write_key_pair_same_register(probe, STM8_FLASH_PUKR, 0x56, 0xAE)
+    return wait_iapsr_mask(probe, STM8_IAPSR_PUL)
+
 
 def cmd_list(_args: argparse.Namespace) -> int:
     for port in list_serial_ports():
@@ -201,6 +213,7 @@ def cmd_erase(args: argparse.Namespace) -> int:
     device = get_device(args.device)
     with open_probe(args) as probe:
         probe.enter_swim()
+        unlock_program_flash(probe)
         probe.flash_erase(device.flash_start, device.flash_size)
     print(f"erased {device.name} program flash")
     return 0
@@ -210,14 +223,15 @@ def cmd_flash(args: argparse.Namespace) -> int:
     print(VOLTAGE_WARNING, file=sys.stderr)
     device = get_device(args.device)
     segments = load_ihex(args.file)
-    image = image_for_range(segments, device.flash_start, device.flash_size)
+    image = image_for_range(segments, device.flash_start, device.flash_size, fill=STM8_FLASH_ERASED_VALUE)
 
     with open_probe(args) as probe:
         probe.enter_swim()
+        unlock_program_flash(probe)
         probe.flash_erase(device.flash_start, device.flash_size)
         for offset in range(0, len(image), device.block_size):
             block = image[offset : offset + device.block_size]
-            if block == bytes([0xFF]) * len(block):
+            if block == bytes([STM8_FLASH_ERASED_VALUE]) * len(block):
                 continue
             probe.flash_write_block(device.flash_start + offset, block)
         if args.verify:

@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "usb_protocol.h"
 
+const char *stm8_flash_last_error(void);
 rpsw_status_t stm8_flash_unlock_program(void);
 rpsw_status_t stm8_flash_unlock_eeprom(void);
 rpsw_status_t stm8_flash_erase_range(uint32_t address, uint32_t length);

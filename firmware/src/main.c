@@ -20,7 +20,13 @@ static uint16_t bounded_strlen(const char *s, uint16_t max_len) {
 }
 
 static void set_last_error(rpsw_status_t status) {
-    snprintf(g_last_error, sizeof(g_last_error), "%s", rpsw_status_text(status));
+    const char *flash_error = stm8_flash_last_error();
+    if (flash_error != NULL && flash_error[0] != '\0') {
+        snprintf(g_last_error, sizeof(g_last_error), "%s: %s",
+                 rpsw_status_text(status), flash_error);
+    } else {
+        snprintf(g_last_error, sizeof(g_last_error), "%s", rpsw_status_text(status));
+    }
 }
 
 static rpsw_status_t handle_frame(const rpsw_frame_t *request,
@@ -99,13 +105,18 @@ static rpsw_status_t handle_frame(const rpsw_frame_t *request,
         return stm8_flash_erase_range(rpsw_get_u32le(&request->payload[0]),
                                       rpsw_get_u32le(&request->payload[4]));
 
-    case CMD_FLASH_WRITE_BLOCK:
+    case CMD_FLASH_WRITE_BLOCK: {
         if (request->length < 6) {
+            return RPSW_ERR_BAD_ARGUMENT;
+        }
+        uint16_t len = rpsw_get_u16le(&request->payload[4]);
+        if (request->length != (uint16_t)(6u + len)) {
             return RPSW_ERR_BAD_ARGUMENT;
         }
         return stm8_flash_write_block(rpsw_get_u32le(&request->payload[0]),
                                       &request->payload[6],
-                                      rpsw_get_u16le(&request->payload[4]));
+                                      len);
+    }
 
     case CMD_FLASH_VERIFY:
         return RPSW_ERR_UNSUPPORTED;

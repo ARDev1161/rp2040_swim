@@ -131,7 +131,7 @@ def list_serial_ports() -> list[str]:
 
 
 class Probe:
-    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 2.0) -> None:
+    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 15.0) -> None:
         if serial is None:
             raise ProtocolError("pyserial is required: python3 -m pip install pyserial")
         self.port = port
@@ -160,7 +160,14 @@ class Probe:
         if response.command != (int(command) | 0x80):
             raise ProtocolError(f"command mismatch: got 0x{response.command:02x}")
         if response.status != Status.OK:
-            raise ProtocolError(f"{command.name} failed: {response.status.name.lower()}")
+            detail = ""
+            if command != Command.GET_LAST_ERROR:
+                try:
+                    detail = self.command(Command.GET_LAST_ERROR).decode("ascii", "replace")
+                except Exception:
+                    detail = ""
+            suffix = f": {detail}" if detail else ""
+            raise ProtocolError(f"{command.name} failed: {response.status.name.lower()}{suffix}")
         return response.payload
 
     def _read_response(self) -> Response:
