@@ -17,7 +17,11 @@
 #define STM8_FLASH_BLOCK_SIZE   64u
 #define STM8_FLASH_ERASED_VALUE 0x00u
 
-#define STM8_CR2_ERASE   0x20u
+#define STM8_OPTION_START 0x004800u
+#define STM8_OPTION_END   0x004840u
+
+#define STM8_CR2_ERASE 0x20u
+#define STM8_CR2_OPT   0x80u
 
 #define STM8_IAPSR_WR_PG_DIS 0x01u
 #define STM8_IAPSR_PUL       0x02u
@@ -81,6 +85,8 @@ static rpsw_status_t flash_busy_delay_and_resync(unsigned delay_us) {
 }
 
 static rpsw_status_t wait_flash_complete(unsigned initial_delay_us) {
+    uint8_t last_iapsr = 0;
+
     if (initial_delay_us != 0u) {
         swim_phy_delay_us(initial_delay_us);
     }
@@ -89,17 +95,34 @@ static rpsw_status_t wait_flash_complete(unsigned initial_delay_us) {
         uint8_t v = 0;
         rpsw_status_t st = read_u8(STM8_FLASH_IAPSR, &v);
         if (st != RPSW_OK) {
+            snprintf(g_flash_last_error, sizeof(g_flash_last_error),
+                     "wait_complete:read_iapsr failed attempt=%u last_iapsr=0x%02x status=%s",
+                     attempt, last_iapsr, rpsw_status_text(st));
             return st;
         }
+
+        last_iapsr = v;
+
         if ((v & STM8_IAPSR_WR_PG_DIS) != 0u) {
+            snprintf(g_flash_last_error, sizeof(g_flash_last_error),
+                     "wait_complete:wr_pg_dis IAPSR=0x%02x", v);
             return RPSW_ERR_TARGET;
         }
-        if ((v & STM8_IAPSR_HVOFF) != 0u) {
+
+        /*
+         * For byte programming EOP is the important completion flag.
+         * For block erase/programming HVOFF may also indicate high-voltage
+         * completion. Accept either, but still reject WR_PG_DIS above.
+         */
+        if ((v & (STM8_IAPSR_EOP | STM8_IAPSR_HVOFF)) != 0u) {
             return RPSW_OK;
         }
-        (void)STM8_IAPSR_EOP; /* EOP is useful for diagnostics, HVOFF is the completion gate. */
+
         swim_phy_delay_us(100);
     }
+
+    snprintf(g_flash_last_error, sizeof(g_flash_last_error),
+             "wait_complete:timeout last_iapsr=0x%02x", last_iapsr);
     return RPSW_ERR_TARGET;
 }
 
@@ -168,25 +191,98 @@ static rpsw_status_t write_key_pair_same_register(uint32_t key_reg, uint8_t key1
     return write_u8(key_reg, key2);
 }
 
-rpsw_status_t stm8_flash_unlock_program(void) {
-    rpsw_status_t st = write_key_pair_same_register(STM8_FLASH_PUKR,
-                                                    STM8_PUKR_KEY1,
-                                                    STM8_PUKR_KEY2);
+rpsw_status_t stm8_flash_unlock_eeprom(void) {
+    uint8_t iapsr = 0;
+    rpsw_status_t st = read_u8(STM8_FLASH_IAPSR, &iapsr);
     if (st != RPSW_OK) {
         return st;
     }
-    return wait_iapsr_mask(STM8_IAPSR_PUL);
-}
+    if ((iapsr & STM8_IAPSR_DUL) != 0u) {
+        return RPSW_OK;
+    }
 
-rpsw_status_t stm8_flash_unlock_eeprom(void) {
-    rpsw_status_t st = write_key_pair_same_register(STM8_FLASH_DUKR,
-                                                    STM8_DUKR_KEY1,
-                                                    STM8_DUKR_KEY2);
+    /*
+     * Keep this as a fallback only. Hardware validation showed that host-side
+     * split MEMORY_WRITE transactions are more reliable for the DUKR sequence
+     * than firmware-side back-to-back key writes on some targets.
+     */
+    st = write_key_pair_same_register(STM8_FLASH_DUKR,
+                                      STM8_DUKR_KEY1,
+                                      STM8_DUKR_KEY2);
     if (st != RPSW_OK) {
         return st;
     }
     return wait_iapsr_mask(STM8_IAPSR_DUL);
 }
+
+rpsw_status_t stm8_flash_write_option_byte(uint32_t address, uint8_t value) {
+    flash_diag_clear();
+
+    if (address < STM8_OPTION_START || address >= STM8_OPTION_END) {
+        flash_diag_set("option:bad_address", address, RPSW_ERR_BAD_ARGUMENT);
+        return RPSW_ERR_BAD_ARGUMENT;
+    }
+
+    rpsw_status_t st = stm8_flash_unlock_eeprom();
+    if (st != RPSW_OK) {
+        flash_diag_set("option:unlock_eeprom", address, st);
+        return st;
+    }
+
+    st = set_flash_cr2(STM8_CR2_OPT);
+    if (st != RPSW_OK) {
+        (void)clear_flash_cr2();
+        flash_diag_set("option:set_cr2_opt", address, st);
+        return st;
+    }
+
+    st = write_u8(address, value);
+    rpsw_status_t trigger_status = st;
+
+    /*
+     * Option-byte programming can make the target temporarily unavailable.
+     * Treat NACK/timeout after the triggering write as a busy condition and
+     * restore SWIM before polling FLASH_IAPSR.
+     */
+    if (st == RPSW_ERR_SWIM_TIMEOUT || st == RPSW_ERR_SWIM_NACK) {
+        st = flash_busy_delay_and_resync(10000u);
+        if (st != RPSW_OK) {
+            snprintf(g_flash_last_error, sizeof(g_flash_last_error),
+                     "option:post_trigger_resync_after_timeout addr=0x%06lx trigger=%s resync=%s",
+                     (unsigned long)address, rpsw_status_text(trigger_status), rpsw_status_text(st));
+        }
+    } else if (st == RPSW_OK) {
+        st = flash_busy_delay_and_resync(10000u);
+        if (st != RPSW_OK) {
+            snprintf(g_flash_last_error, sizeof(g_flash_last_error),
+                     "option:post_trigger_resync addr=0x%06lx resync=%s",
+                     (unsigned long)address, rpsw_status_text(st));
+        }
+    } else {
+        flash_diag_set("option:trigger_write", address, st);
+    }
+
+    if (st != RPSW_OK) {
+        (void)clear_flash_cr2();
+        return st;
+    }
+
+    st = wait_flash_complete(0u);
+    if (st != RPSW_OK) {
+        (void)clear_flash_cr2();
+        flash_diag_set("option:wait_complete", address, st);
+        return st;
+    }
+
+    st = clear_flash_cr2();
+    if (st != RPSW_OK) {
+        flash_diag_set("option:clear_cr2", address, st);
+        return st;
+    }
+
+    return RPSW_OK;
+}
+
 
 rpsw_status_t stm8_flash_erase_range(uint32_t address, uint32_t length) {
     flash_diag_clear();

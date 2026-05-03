@@ -118,6 +118,13 @@ static rpsw_status_t handle_frame(const rpsw_frame_t *request,
                                       len);
     }
 
+    case CMD_OPTION_WRITE_BYTE:
+        if (request->length < 5) {
+            return RPSW_ERR_BAD_ARGUMENT;
+        }
+        return stm8_flash_write_option_byte(rpsw_get_u32le(&request->payload[0]),
+                                            request->payload[4]);
+
     case CMD_FLASH_VERIFY:
         return RPSW_ERR_UNSUPPORTED;
 

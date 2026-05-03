@@ -26,6 +26,7 @@ typedef enum {
     CMD_DEBUG_WAVEFORM = 0x0E,
     CMD_GET_SWIM_DEBUG = 0x0F,
     CMD_ENTRY_WAVEFORM = 0x10,
+    CMD_OPTION_WRITE_BYTE = 0x11,
 } rpsw_command_t;
 
 typedef enum {

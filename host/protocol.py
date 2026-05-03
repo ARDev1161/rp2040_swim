@@ -37,6 +37,7 @@ class Command(enum.IntEnum):
     DEBUG_WAVEFORM = 0x0E
     GET_SWIM_DEBUG = 0x0F
     ENTRY_WAVEFORM = 0x10
+    OPTION_WRITE_BYTE = 0x11
 
 
 class Status(enum.IntEnum):
@@ -308,6 +309,8 @@ class Probe:
     def flash_write_block(self, address: int, data: bytes) -> None:
         self.command(Command.FLASH_WRITE_BLOCK, struct.pack("<IH", address, len(data)) + data)
 
+    def option_write_byte(self, address: int, value: int) -> None:
+        self.command(Command.OPTION_WRITE_BYTE, struct.pack("<IB", address, value & 0xFF))
 
 def autodetect_port() -> str:
     ports = list_serial_ports()

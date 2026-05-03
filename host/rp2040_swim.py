@@ -143,19 +143,16 @@ def rop_is_enabled(rop_byte: int) -> bool:
     return (rop_byte & 0xFF) == STM8_ROP_ENABLED_VALUE
 
 
-def write_rop_byte(probe: Probe, device_name: str, value: int) -> int:
-    """Write STM8 OPT0/ROP byte and wait for the option write to complete."""
+def write_rop_byte(probe: Probe, device_name: str, value: int) -> None:
+    """Write STM8 OPT0/ROP byte through firmware-side atomic option transaction.
+
+    The DUKR unlock is intentionally done host-side first: on this target,
+    split host MEMORY_WRITE transactions are more reliable for the EEPROM/OPT
+    unlock key sequence than firmware-side back-to-back key writes.
+    """
     device = get_device(device_name)
     unlock_data_eeprom(probe)
-    set_option_byte_programming(probe, True)
-    try:
-        write_u8(probe, device.option_start, value)
-        return wait_flash_eop(probe)
-    finally:
-        try:
-            set_option_byte_programming(probe, False)
-        except ProtocolError:
-            pass
+    probe.option_write_byte(device.option_start, value)
 
 
 def reconnect_after_rop_change(probe: Probe, attempts: int = 12) -> None:
@@ -294,22 +291,73 @@ def cmd_rop_status(args: argparse.Namespace) -> int:
 
 
 def cmd_set_rop(args: argparse.Namespace) -> int:
-    print(
-        "error: set-rop is temporarily disabled. "
-        "The first hardware test produced an invalid option-byte state. "
-        "ROP writes must be reworked as a firmware-side atomic option-byte transaction.",
-        file=sys.stderr,
-    )
-    return 1
+    if not args.yes_i_know:
+        print(
+            "error: refusing to enable ROP without --yes-i-know. "
+            "After this operation, program flash/data EEPROM readout will be protected.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(VOLTAGE_WARNING, file=sys.stderr)
+    device = get_device(args.device)
+    with open_probe(args) as probe:
+        probe.enter_swim()
+        before = read_rop_byte(probe, device.name)
+        if rop_is_enabled(before):
+            print(f"Device: {device.name}")
+            print(f"OPT0/ROP @ 0x{device.option_start:06x}: 0x{before:02x}")
+            print("ROP: enabled")
+            print("set-rop: already enabled; nothing to do")
+            return 0
+
+        write_rop_byte(probe, device.name, STM8_ROP_ENABLED_VALUE)
+        reconnect_after_rop_change(probe)
+        after = read_rop_byte(probe, device.name)
+
+    if not rop_is_enabled(after):
+        raise ProtocolError(f"ROP enable verify failed: before=0x{before:02x}, after=0x{after:02x}")
+
+    print(f"Device: {device.name}")
+    print(f"OPT0/ROP before: 0x{before:02x}")
+    print(f"OPT0/ROP after:  0x{after:02x}")
+    print("ROP: enabled")
+    return 0
 
 
 def cmd_unprotect_rop(args: argparse.Namespace) -> int:
-    print(
-        "error: unprotect-rop is temporarily disabled. "
-        "ROP unprotect is destructive and option-byte programming is not validated yet.",
-        file=sys.stderr,
-    )
-    return 1
+    if not args.yes_erase_all:
+        print(f"error: refusing to unprotect ROP without --yes-erase-all. {ROP_DESTRUCTIVE_WARNING}", file=sys.stderr)
+        return 1
+
+    print(VOLTAGE_WARNING, file=sys.stderr)
+    print(ROP_DESTRUCTIVE_WARNING, file=sys.stderr)
+    device = get_device(args.device)
+    with open_probe(args) as probe:
+        probe.enter_swim()
+        before = read_rop_byte(probe, device.name)
+        if not rop_is_enabled(before):
+            print(f"Device: {device.name}")
+            print(f"OPT0/ROP @ 0x{device.option_start:06x}: 0x{before:02x}")
+            print("ROP: disabled")
+            print("unprotect-rop: already disabled; nothing to do")
+            return 0
+
+        write_rop_byte(probe, device.name, STM8_ROP_DISABLED_VALUE)
+        reconnect_after_rop_change(probe)
+        after = read_rop_byte(probe, device.name)
+        flash_probe = probe.read_memory(device.flash_start, 1)
+
+    if rop_is_enabled(after):
+        raise ProtocolError(f"ROP unprotect verify failed: before=0x{before:02x}, after=0x{after:02x}")
+
+    print(f"Device: {device.name}")
+    print(f"OPT0/ROP before: 0x{before:02x}")
+    print(f"OPT0/ROP after:  0x{after:02x}")
+    print(f"Flash read check @ 0x{device.flash_start:06x}: 0x{flash_probe[0]:02x}")
+    print("ROP: disabled")
+    print("Mass erase completed; program flash, data EEPROM and option bytes must be treated as erased/defaulted.")
+    return 0
 
 
 def cmd_write_ram(args: argparse.Namespace) -> int:
