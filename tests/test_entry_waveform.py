@@ -106,6 +106,71 @@ def test_comm_reset_wait_uses_pio_tick_tx_and_rx_capture() -> None:
     assert "record_sync_measurement_ns(width.low_ns, width.loops_used);" in function
 
 
+def test_pio_state_machines_restart_at_program_start() -> None:
+    tx_source = (REPO_ROOT / "firmware/src/swim_pio_waveform.c").read_text()
+    rx_source = (REPO_ROOT / "firmware/src/swim_pio_rx.c").read_text()
+    assert "restart_tx_sm_at_program_start" in tx_source
+    assert "pio_encode_jmp(g_pio.offset)" in tx_source
+    assert "restart_rx_sm_at_program_start" in rx_source
+    assert "pio_encode_jmp(g_rx_offset)" in rx_source
+
+
+def test_ack_after_pio_tx_uses_pio_rx_width_capture() -> None:
+    source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
+    function = source[source.index("bool swim_phy_write_frame_bits_read_ack"):]
+    function = function[:function.index("bool swim_phy_read_bit")]
+    assert "swim_pio_emit_tick_segments_capture_response" in function
+    assert "swim_pio_emit_tick_segments_wait_response" not in function
+    assert "response.low_ns" in function
+
+
+def test_read_bit_uses_pio_rx_width_capture() -> None:
+    source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
+    function = source[source.index("bool swim_phy_read_bit"):]
+    function = function[:function.index("bool swim_phy_wait_sync")]
+    assert "swim_pio_rx_arm_now" in function
+    assert "swim_pio_rx_get_width" in function
+    assert "width.low_ns" in function
+
+
+def test_recv_byte_uses_single_pio_frame_capture() -> None:
+    link_source = (REPO_ROOT / "firmware/src/swim_link.c").read_text()
+    recv = link_source[link_source.index("static rpsw_status_t recv_byte"):]
+    recv = recv[:recv.index("rpsw_status_t swim_link_enter")]
+    assert "swim_phy_read_frame_bits" in recv
+    assert "for (unsigned bit" not in recv
+    phy_source = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
+    assert "swim_pio_rx_frame10" in phy_source
+    cmake = (REPO_ROOT / "firmware/CMakeLists.txt").read_text()
+    assert "pio/swim_rx_width.pio" in cmake
+
+
+def test_rotf_first_data_byte_captured_with_final_address_ack() -> None:
+    source = (REPO_ROOT / "firmware/src/swim_link.c").read_text()
+    read_fn = source[source.index("rpsw_status_t swim_link_read"):]
+    read_fn = read_fn[:read_fn.index("rpsw_status_t swim_link_write")]
+    assert "send_byte_read_ack_frame_labeled((uint8_t)(address & 0xffu), &data[0], \"ROTF AL\")" in read_fn
+    assert "for (size_t i = 1; i < len; i++)" in read_fn
+    phy = (REPO_ROOT / "firmware/src/swim_phy.c").read_text()
+    assert "swim_pio_emit_tick_segments_capture_ack_frame" in phy
+    cmake = (REPO_ROOT / "firmware/CMakeLists.txt").read_text()
+    assert "pio/swim_rx_ack_frame.pio" not in cmake
+
+
+def test_pio_programs_fit_single_pio_instruction_memory() -> None:
+    rx = (REPO_ROOT / "firmware/pio/swim_rx_width.pio").read_text()
+    assert "The combined program is deliberately 18 instructions" in rx
+    cmake = (REPO_ROOT / "firmware/CMakeLists.txt").read_text()
+    assert "pio/swim_rx_frame.pio" not in cmake
+    assert "pio/swim_rx_ack_frame.pio" not in cmake
+
+
+def test_pio_rx_normalizes_shifted_frame_bits() -> None:
+    source = (REPO_ROOT / "firmware/src/swim_pio_rx.c").read_text()
+    assert "normalize_shifted_bits" in source
+    assert "raw >> (32u - bit_count)" in source
+
+
 def test_entry_waveform_command_exists() -> None:
     parser = build_parser()
     args = parser.parse_args(["entry-waveform", "--port", "/dev/null", "--delay-ms", "1"])
