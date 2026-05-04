@@ -128,16 +128,29 @@ void swim_phy_init(const swim_phy_config_t *config) {
         g_phy.speed = SWIM_SPEED_LOW;
     }
     g_debug.speed = g_phy.speed;
+
     swim_release_pin(g_phy.swim_pin, g_phy.internal_pullup);
     swim_release_pin(g_phy.nrst_pin, true);
-    rpsw_status_t st = swim_pio_waveform_init(g_phy.swim_pin, g_phy.internal_pullup);
-    if (st == RPSW_OK) {
-        g_debug.phy_backend = SWIM_PHY_BACKEND_PIO;
-        set_pio_debug(true, "ok");
-    } else {
-        g_debug.phy_backend = SWIM_PHY_BACKEND_BITBANG_FALLBACK;
-        set_pio_fallback_warning(swim_pio_waveform_error());
-    }
+
+    /*
+     * Passive boot: do not claim SWIM pin with PIO here.
+     * PIO is initialized lazily by ENTER_SWIM.
+     */
+    g_debug.phy_backend = SWIM_PHY_BACKEND_BITBANG_FALLBACK;
+    set_pio_debug(false, "lazy; not initialized");
+}
+
+void swim_phy_release_target(void) {
+    /*
+     * Return both lines to passive state.
+     *
+     * Important after PIO use: gpio_init()/swim_release_pin() returns the pin
+     * to SIO input mode, so SWIM is no longer owned by PIO.
+     */
+    swim_release_pin(g_phy.swim_pin, g_phy.internal_pullup);
+    swim_release_pin(g_phy.nrst_pin, true);
+
+    g_debug.synced = false;
 }
 
 void swim_phy_set_pins(uint swim_pin, uint nrst_pin, bool internal_pullup) {
@@ -232,20 +245,37 @@ static void bitbang_emit_segments(const swim_segment_t *segments, size_t count) 
     swim_phy_release();
 }
 
-static rpsw_status_t emit_entry_segments(size_t count) {
+static bool ensure_pio_waveform_initialized(void) {
     if (swim_pio_waveform_available()) {
+        return true;
+    }
+
+    rpsw_status_t st = swim_pio_waveform_init(g_phy.swim_pin, g_phy.internal_pullup);
+    if (st == RPSW_OK) {
+        g_debug.phy_backend = SWIM_PHY_BACKEND_PIO;
+        set_pio_debug(true, "ok");
+        return true;
+    }
+
+    g_debug.phy_backend = SWIM_PHY_BACKEND_BITBANG_FALLBACK;
+    set_pio_fallback_warning(swim_pio_waveform_error());
+    return false;
+}
+
+static rpsw_status_t emit_entry_segments(size_t count) {
+    if (ensure_pio_waveform_initialized()) {
         rpsw_status_t st = swim_pio_emit_segments(g_entry_segments, count);
         if (st == RPSW_OK) {
             g_debug.phy_backend = SWIM_PHY_BACKEND_PIO;
             set_pio_debug(true, "ok");
         } else {
-            set_pio_debug(true, swim_pio_waveform_error());
+            set_pio_debug(false, swim_pio_waveform_error());
         }
         return st;
     }
+
     swim_phy_release();
     g_debug.phy_backend = SWIM_PHY_BACKEND_BITBANG_FALLBACK;
-    set_pio_fallback_warning(swim_pio_waveform_error());
     bitbang_emit_segments(g_entry_segments, count);
     swim_phy_release();
     return RPSW_OK;
@@ -321,6 +351,12 @@ rpsw_status_t swim_phy_entry_sequence_um0470(void) {
 }
 
 bool swim_phy_entry_sequence_um0470_wait_sync(uint32_t timeout_us) {
+    if (!ensure_pio_waveform_initialized()) {
+        swim_phy_release();
+        bitbang_emit_segments(g_entry_segments, entry_segment_count() - 1u);
+        return false;
+    }
+
     swim_pio_rx_width_t width = {0};
 
     /*

@@ -63,9 +63,15 @@ static rpsw_status_t handle_frame(const rpsw_frame_t *request,
         return swim_link_enter();
 
     case CMD_RESET_TARGET:
+        swim_phy_release();
         swim_phy_nrst_assert();
         sleep_ms(20);
         swim_phy_nrst_release();
+        swim_phy_release_target();
+        return RPSW_OK;
+
+    case CMD_RELEASE_TARGET:
+        swim_phy_release_target();
         return RPSW_OK;
 
     case CMD_SWIM_READ:

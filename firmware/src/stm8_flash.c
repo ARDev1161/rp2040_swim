@@ -20,6 +20,7 @@
 #define STM8_OPTION_START 0x004800u
 #define STM8_OPTION_END   0x004840u
 
+#define STM8_CR2_PRG   0x01u
 #define STM8_CR2_ERASE 0x20u
 #define STM8_CR2_OPT   0x80u
 
@@ -385,13 +386,14 @@ rpsw_status_t stm8_flash_write_block(uint32_t address, const uint8_t *data, size
     }
 
     /*
-     * Use conservative byte programming for the MVP. Do not set PRG/FPRG here:
-     * those bits are for block programming modes and require a different write
-     * sequence. Byte programming only needs PUL plus a direct byte write.
+     * Use conservative byte programming for the MVP. Program memory is already
+     * unlocked by the host/backend before this command, but STM8 program flash
+     * writes still need PRG/NPRG set. Without PRG the controller reports
+     * WR_PG_DIS even when IAPSR.PUL is set.
      */
-    st = clear_flash_cr2();
+    st = set_flash_cr2(STM8_CR2_PRG);
     if (st != RPSW_OK) {
-        flash_diag_set("write:clear_cr2", address, st);
+        flash_diag_set("write:set_cr2_prg", address, st);
         return st;
     }
 
@@ -407,15 +409,18 @@ rpsw_status_t stm8_flash_write_block(uint32_t address, const uint8_t *data, size
             if (st != RPSW_OK) {
                 snprintf(g_flash_last_error, sizeof(g_flash_last_error),
                          "write:post_trigger_resync_after_timeout addr=0x%06lx trigger=%s resync=%s",
-                         (unsigned long)(address + (uint32_t)i), rpsw_status_text(trigger_status), rpsw_status_text(st));
+                         (unsigned long)(address + (uint32_t)i),
+                         rpsw_status_text(trigger_status),
+                         rpsw_status_text(st));
             }
         } else if (st == RPSW_OK) {
-            st = flash_busy_delay_and_resync(5000u);
-            if (st != RPSW_OK) {
-                snprintf(g_flash_last_error, sizeof(g_flash_last_error),
-                         "write:post_trigger_resync addr=0x%06lx resync=%s",
-                         (unsigned long)(address + (uint32_t)i), rpsw_status_text(st));
-            }
+            /*
+             * For byte programming a successful write ACK means SWIM is still
+             * alive. Do not issue COMM_RESET here: it can race with EOP/HVOFF
+             * observation and make wait_flash_complete() report a false target
+             * error. Just give the flash controller time to finish.
+             */
+            swim_phy_delay_us(5000u);
         } else {
             flash_diag_set("write:trigger_write", address + (uint32_t)i, st);
         }
@@ -425,11 +430,21 @@ rpsw_status_t stm8_flash_write_block(uint32_t address, const uint8_t *data, size
         }
         st = wait_flash_complete(0u);
         if (st != RPSW_OK) {
-            (void)clear_flash_cr2();
-            flash_diag_set("write:wait_complete", address + (uint32_t)i, st);
+            if (g_flash_last_error[0] == '\0') {
+                (void)clear_flash_cr2();
+                if (g_flash_last_error[0] == '\0') {
+                    flash_diag_set("write:wait_complete", address + (uint32_t)i, st);
+                }
+            }
             return st;
         }
     }
 
-    return clear_flash_cr2();
+    st = clear_flash_cr2();
+    if (st != RPSW_OK) {
+        flash_diag_set("write:clear_cr2", address, st);
+        return st;
+    }
+
+     return RPSW_OK;
 }

@@ -59,6 +59,7 @@ typedef struct {
 } swim_phy_debug_t;
 
 void swim_phy_init(const swim_phy_config_t *config);
+void swim_phy_release_target(void);
 void swim_phy_set_pins(uint swim_pin, uint nrst_pin, bool internal_pullup);
 bool swim_phy_set_speed(swim_speed_t speed);
 void swim_phy_release(void);
