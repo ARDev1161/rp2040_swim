@@ -20,6 +20,15 @@
 #define SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS 8u
 #define SWIM_LOW_SPEED_ZERO_MIN_LOW_CLOCKS 9u
 #define SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS 22u
+
+#define SWIM_HIGH_SPEED_ONE_LOW_CLOCKS 2u
+#define SWIM_HIGH_SPEED_ONE_HIGH_CLOCKS 8u
+#define SWIM_HIGH_SPEED_ZERO_LOW_CLOCKS 8u
+#define SWIM_HIGH_SPEED_ZERO_HIGH_CLOCKS 2u
+#define SWIM_HIGH_SPEED_ONE_MAX_LOW_CLOCKS 4u
+#define SWIM_HIGH_SPEED_ZERO_MIN_LOW_CLOCKS 5u
+#define SWIM_HIGH_SPEED_INTERFRAME_GAP_CLOCKS 10u
+
 #define SWIM_PHY_BACKEND_PIO 0u
 #define SWIM_PHY_BACKEND_BITBANG_FALLBACK 1u
 #define SWIM_ENTRY_PROTOCOL_US 6016u
@@ -161,11 +170,11 @@ void swim_phy_set_pins(uint swim_pin, uint nrst_pin, bool internal_pullup) {
 }
 
 bool swim_phy_set_speed(swim_speed_t speed) {
-    /*
-     * High-speed SWIM requires HSIT/HS handling and tighter sampling than this
-     * first-pass PHY provides. Keep the link explicitly low-speed only.
-     */
-    if (speed != SWIM_SPEED_LOW) {
+	if (speed != SWIM_SPEED_LOW && speed != SWIM_SPEED_HIGH) {
+		return false;
+	}
+	/* High-speed may be selected only after the link measured Tswim. */
+	if (speed == SWIM_SPEED_HIGH && !swim_phy_timing_ready()) {
         return false;
     }
     g_phy.speed = speed;
@@ -303,6 +312,31 @@ static uint32_t swim_clocks_to_cycles_from_tswim(uint32_t tswim_ns, uint32_t clo
     uint64_t ns = (uint64_t)tswim_ns * (uint64_t)clocks;
     uint64_t cycles = ((uint64_t)clock_get_hz(clk_sys) * ns + 999999999ull) / 1000000000ull;
     return cycles > 0 ? (uint32_t)cycles : 1u;
+}
+
+static uint32_t current_interframe_gap_clocks(void) {
+	return g_phy.speed == SWIM_SPEED_HIGH ?
+		SWIM_HIGH_SPEED_INTERFRAME_GAP_CLOCKS : SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS;
+}
+
+static uint32_t current_one_max_low_clocks(void) {
+	return g_phy.speed == SWIM_SPEED_HIGH ?
+		SWIM_HIGH_SPEED_ONE_MAX_LOW_CLOCKS : SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+}
+
+static uint32_t current_zero_min_low_clocks(void) {
+	return g_phy.speed == SWIM_SPEED_HIGH ?
+		SWIM_HIGH_SPEED_ZERO_MIN_LOW_CLOCKS : SWIM_LOW_SPEED_ZERO_MIN_LOW_CLOCKS;
+}
+
+static void current_bit_clocks(bool bit, uint32_t *low_clocks, uint32_t *high_clocks) {
+	if (g_phy.speed == SWIM_SPEED_HIGH) {
+		*low_clocks = bit ? SWIM_HIGH_SPEED_ONE_LOW_CLOCKS : SWIM_HIGH_SPEED_ZERO_LOW_CLOCKS;
+		*high_clocks = bit ? SWIM_HIGH_SPEED_ONE_HIGH_CLOCKS : SWIM_HIGH_SPEED_ZERO_HIGH_CLOCKS;
+	} else {
+		*low_clocks = bit ? SWIM_LOW_SPEED_ONE_LOW_CLOCKS : SWIM_LOW_SPEED_ZERO_LOW_CLOCKS;
+		*high_clocks = bit ? SWIM_LOW_SPEED_ONE_HIGH_CLOCKS : SWIM_LOW_SPEED_ZERO_HIGH_CLOCKS;
+	}
 }
 
 static void update_low_speed_cycle_cache(void) {
@@ -527,7 +561,7 @@ bool swim_phy_write_bit(bool bit) {
      * derived from the target synchronization frame; do not guess if no target
      * has been measured.
      */
-    if (g_phy.speed != SWIM_SPEED_LOW || !swim_phy_timing_ready()) {
+    if (!swim_phy_timing_ready()) {
         return false;
     }
 
@@ -538,8 +572,10 @@ bool swim_phy_write_bit(bool bit) {
      */
     swim_phy_sio_input();
 
-    uint32_t low_cycles = bit ? g_low_speed_one_low_cycles : g_low_speed_zero_low_cycles;
-    uint32_t high_cycles = bit ? g_low_speed_one_high_cycles : g_low_speed_zero_high_cycles;
+	uint32_t low_clocks = 0, high_clocks = 0;
+	current_bit_clocks(bit, &low_clocks, &high_clocks);
+	uint32_t low_cycles = swim_clocks_to_cycles_from_tswim(g_debug.derived_tswim_ns, low_clocks);
+	uint32_t high_cycles = swim_clocks_to_cycles_from_tswim(g_debug.derived_tswim_ns, high_clocks);
     swim_phy_sio_drive_low_fast();
     busy_wait_at_least_cycles(low_cycles);
     swim_phy_sio_release_fast();
@@ -548,8 +584,7 @@ bool swim_phy_write_bit(bool bit) {
 }
 
 bool swim_phy_write_frame_bits(uint32_t bits_msb_first, unsigned bit_count) {
-    if (g_phy.speed != SWIM_SPEED_LOW || !swim_phy_timing_ready() ||
-        bit_count == 0 || bit_count > 16 || !swim_pio_waveform_available()) {
+    if (!swim_phy_timing_ready() || bit_count == 0 || bit_count > 16 || !swim_pio_waveform_available()) {
         return false;
     }
 
@@ -561,8 +596,9 @@ bool swim_phy_write_frame_bits(uint32_t bits_msb_first, unsigned bit_count) {
     };
     for (unsigned i = 0; i < bit_count; i++) {
         bool bit = ((bits_msb_first >> (bit_count - 1u - i)) & 1u) != 0u;
-        uint32_t low_clocks = bit ? SWIM_LOW_SPEED_ONE_LOW_CLOCKS : SWIM_LOW_SPEED_ZERO_LOW_CLOCKS;
-        uint32_t high_clocks = bit ? SWIM_LOW_SPEED_ONE_HIGH_CLOCKS : SWIM_LOW_SPEED_ZERO_HIGH_CLOCKS;
+		uint32_t low_clocks = 0, high_clocks = 0;
+		current_bit_clocks(bit, &low_clocks, &high_clocks);
+
         segments[segment_count++] = (swim_pio_tick_segment_t){
             .level = SWIM_SEG_LOW,
             .duration_ticks = low_clocks * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
@@ -587,8 +623,7 @@ bool swim_phy_write_frame_bits(uint32_t bits_msb_first, unsigned bit_count) {
 
 bool swim_phy_write_frame_bits_read_ack(uint32_t bits_msb_first, unsigned bit_count,
                                         uint32_t timeout_us, bool *ack) {
-    if (ack == NULL || g_phy.speed != SWIM_SPEED_LOW || !swim_phy_timing_ready() ||
-        bit_count == 0 || bit_count > 16 || !swim_pio_waveform_available()) {
+    if (ack == NULL || !swim_phy_timing_ready() || bit_count == 0 || bit_count > 16 || !swim_pio_waveform_available()) {
         return false;
     }
 
@@ -596,7 +631,7 @@ bool swim_phy_write_frame_bits_read_ack(uint32_t bits_msb_first, unsigned bit_co
     size_t segment_count = 0;
     segments[segment_count++] = (swim_pio_tick_segment_t){
         .level = SWIM_SEG_RELEASE,
-        .duration_ticks = SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
+        .duration_ticks = current_interframe_gap_clocks() * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
     };
     for (unsigned i = 0; i < bit_count; i++) {
         bool bit = ((bits_msb_first >> (bit_count - 1u - i)) & 1u) != 0u;
@@ -633,7 +668,7 @@ bool swim_phy_write_frame_bits_read_ack(uint32_t bits_msb_first, unsigned bit_co
 
     uint32_t low_clocks = (response.low_ns + (g_debug.derived_tswim_ns / 2u)) /
                            g_debug.derived_tswim_ns;
-    *ack = low_clocks <= SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+    *ack = low_clocks <= current_one_max_low_clocks();
     return true;
 }
 
@@ -646,12 +681,12 @@ static bool classify_low_width_ns(uint32_t low_ns, bool *bit) {
     (uint32_t)(((uint64_t)low_ns + (g_debug.derived_tswim_ns / 2u)) /
     g_debug.derived_tswim_ns);
 
-    if (low_clocks <= SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS) {
+    if (low_clocks <= current_one_max_low_clocks()) {
         *bit = true;
         return true;
     }
 
-    if (low_clocks >= SWIM_LOW_SPEED_ZERO_MIN_LOW_CLOCKS) {
+    if (low_clocks >= current_zero_min_low_clocks()) {
         *bit = false;
         return true;
     }
@@ -678,7 +713,7 @@ static bool build_tx_frame_segments_ex(uint32_t bits,
         }
         segments[out++] = (swim_pio_tick_segment_t){
             .level = SWIM_SEG_RELEASE,
-            .duration_ticks = SWIM_LOW_SPEED_INTERFRAME_GAP_CLOCKS * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
+            .duration_ticks = current_interframe_gap_clocks() * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
         };
     }
 
@@ -696,11 +731,11 @@ static bool build_tx_frame_segments_ex(uint32_t bits,
      * Do NOT add SWIM_PIO_SEGMENT_OVERHEAD_TICKS here. encode_tick_segments()
      * subtracts that internally from the requested duration.
      */
-    const uint32_t short_ticks = 2u * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK;
-    const uint32_t long_ticks  = 20u * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK;
 
     for (int i = (int)bit_count - 1; i >= 0; --i) {
         bool bit = ((bits >> (uint)i) & 1u) != 0u;
+		uint32_t low_clocks = 0, high_clocks = 0;
+		current_bit_clocks(bit, &low_clocks, &high_clocks);
 
         if (out + 2u > SWIM_PHY_MAX_TX_FRAME_SEGMENTS) {
             return false;
@@ -708,12 +743,12 @@ static bool build_tx_frame_segments_ex(uint32_t bits,
 
         segments[out++] = (swim_pio_tick_segment_t){
             .level = SWIM_SEG_LOW,
-            .duration_ticks = bit ? short_ticks : long_ticks,
+            .duration_ticks = low_clocks * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
         };
 
         segments[out++] = (swim_pio_tick_segment_t){
             .level = SWIM_SEG_RELEASE,
-            .duration_ticks = bit ? long_ticks : short_ticks,
+            .duration_ticks = high_clocks * SWIM_PIO_FRAME_TICKS_PER_SWIM_CLOCK,
         };
     }
 
@@ -840,7 +875,7 @@ bool swim_phy_write_frame_bits_read_ack_and_frame(uint32_t bits,
      * short 2*Tswim HIGH gaps. This path pushes only one decoded raw word.
      */
 
-    uint32_t threshold_ns = g_debug.derived_tswim_ns * SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+    uint32_t threshold_ns = g_debug.derived_tswim_ns * current_one_max_low_clocks();
     uint32_t threshold_loops = swim_pio_rx_ns_to_max_loops(threshold_ns);
     if (threshold_loops == 0u) {
         threshold_loops = 1u;
@@ -925,7 +960,7 @@ bool swim_phy_write_bit_read_target_frame(bool ack, uint32_t timeout_us, uint32_
         return false;
     }
 
-    uint32_t threshold_ns = g_debug.derived_tswim_ns * SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+    uint32_t threshold_ns = g_debug.derived_tswim_ns * current_one_max_low_clocks();
     uint32_t threshold_loops = swim_pio_rx_ns_to_max_loops(threshold_ns);
     if (threshold_loops == 0u) {
         threshold_loops = 1u;
@@ -1010,7 +1045,7 @@ bool swim_phy_read_target_frame(uint32_t timeout_us, uint32_t *rx_frame) {
      * per bit can lose sync. Use the PIO decode program and push one raw word
      * after all 10 bits are decoded.
      */
-    uint32_t threshold_ns = g_debug.derived_tswim_ns * SWIM_LOW_SPEED_ONE_MAX_LOW_CLOCKS;
+    uint32_t threshold_ns = g_debug.derived_tswim_ns * current_one_max_low_clocks();
     uint32_t threshold_loops = swim_pio_rx_ns_to_max_loops(threshold_ns);
     if (threshold_loops == 0u) {
         threshold_loops = 1u;
@@ -1102,7 +1137,7 @@ static bool swim_phy_read_bit_pio(uint32_t timeout_us, bool *ok) {
     *   0: 20*Tswim
     * Give enough budget for a long zero plus margin.
     */
-    uint32_t max_ns = g_debug.derived_tswim_ns * 80u;
+    uint32_t max_ns = g_debug.derived_tswim_ns * (g_phy.speed == SWIM_SPEED_HIGH ? 32u : 80u);
     if (max_ns < 10000u) {
         max_ns = 10000u;
     }
@@ -1175,8 +1210,9 @@ bool swim_phy_wait_sync(uint32_t timeout_us) {
 }
 
 bool swim_phy_timing_ready(void) {
-    return g_debug.synced && g_debug.derived_tswim_ns != 0 &&
-           g_debug.sync_low_loop_count != 0 && g_phy.speed == SWIM_SPEED_LOW;
+    return g_debug.synced &&
+           g_debug.derived_tswim_ns != 0 &&
+           g_debug.sync_low_loop_count != 0 ;
 }
 
 void swim_phy_reset_timing(void) {

@@ -12,8 +12,14 @@
 #define SWIM_READ_TIMEOUT_US 5000u
 #define SWIM_SYNC_TIMEOUT_US 20000u
 #define SWIM_CSR_ADDR 0x007F80u
+#define DM_CSR2_ADDR 0x007F99u
+#define DM_CSR2_STALL 0x08u
 #define SWIM_CSR_SAFE_MASK 0x80u
+#define SWIM_CSR_NO_ACCESS 0x40u
 #define SWIM_CSR_SWIM_DM 0x20u
+#define SWIM_CSR_HS 0x10u
+#define SWIM_CSR_HSIT 0x02u
+#define SWIM_CSR_WRITABLE_MASK 0xbdU
 #define SWIM_CSR_INIT_VALUE (SWIM_CSR_SAFE_MASK | SWIM_CSR_SWIM_DM)
 
 static bool parity3(uint8_t v) {
@@ -124,6 +130,78 @@ static rpsw_status_t send_byte_read_ack_frame_labeled(uint8_t byte, uint8_t *tar
     return st;
 }
 
+static rpsw_status_t swim_link_stall_target(void) {
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        uint8_t csr2 = 0;
+
+        if (attempt != 0) {
+            sleep_us(500);
+        }
+
+        rpsw_status_t st = swim_link_read(DM_CSR2_ADDR, &csr2, 1u);
+        if (st != RPSW_OK) {
+            continue;
+        }
+
+        csr2 |= DM_CSR2_STALL;
+        st = swim_link_write(DM_CSR2_ADDR, &csr2, 1u);
+        if (st == RPSW_OK) {
+            return RPSW_OK;
+        }
+    }
+
+    return RPSW_ERR_SWIM_TIMEOUT;
+}
+
+static rpsw_status_t swim_link_handle_swim_csr(swim_csr_action_t action) {
+    if (action == SWIM_CSR_WRITE_INIT_AND_VERIFY) {
+        uint8_t csr = SWIM_CSR_INIT_VALUE;
+
+        swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_WRITE_START);
+
+        rpsw_status_t st = swim_link_write(SWIM_CSR_ADDR, &csr, 1u);
+        if (st != RPSW_OK) {
+            return st;
+        }
+
+        swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_WRITE_OK);
+    }
+
+    uint8_t csr_readback = 0;
+
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_READ_START);
+
+    rpsw_status_t st = swim_link_read(SWIM_CSR_ADDR, &csr_readback, 1u);
+    if (st != RPSW_OK) {
+        swim_phy_set_swim_csr_debug(0u, false);
+        return st;
+    }
+
+    swim_phy_set_swim_csr_debug(csr_readback, true);
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_READ_OK);
+
+    if ((csr_readback & SWIM_CSR_SWIM_DM) == 0u) {
+        return RPSW_ERR_TARGET;
+    }
+
+    return RPSW_OK;
+}
+
+static rpsw_status_t swim_link_release_reset_and_resync(void) {
+    swim_phy_nrst_release();
+    sleep_ms(1);
+
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_COMM_RESET_SENT);
+
+    if (!swim_phy_comm_reset_wait_sync(SWIM_SYNC_TIMEOUT_US)) {
+        return RPSW_ERR_SWIM_TIMEOUT;
+    }
+
+    swim_phy_mark_second_sync_seen();
+    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SYNC2_OK);
+    return RPSW_OK;
+}
+
 rpsw_status_t swim_link_enter(void) {
     rpsw_status_t st = RPSW_OK;
 
@@ -147,42 +225,41 @@ rpsw_status_t swim_link_enter(void) {
     swim_phy_set_enter_stage(SWIM_ENTER_STAGE_ENTRY_SENT);
     swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SYNC1_OK);
 
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_COMM_RESET_SENT);
-    if (!swim_phy_comm_reset_wait_sync(SWIM_SYNC_TIMEOUT_US)) {
-        st = RPSW_ERR_SWIM_TIMEOUT;
-        goto fail;
-    }
-    swim_phy_mark_second_sync_seen();
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SYNC2_OK);
-
-    uint8_t csr = SWIM_CSR_INIT_VALUE;
-
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_WRITE_START);
-    st = swim_link_write(SWIM_CSR_ADDR, &csr, 1);
+    /*
+     * UM0470 sequence:
+     * - after entry sync, write 0xA0 to SWIM_CSR while reset is still held;
+     * - release reset and wait 1 ms for option-byte loading / stabilization;
+     * - then issue communication reset to get a more reliable calibrated sync.
+     */
+    st = swim_link_handle_swim_csr(SWIM_CSR_WRITE_INIT_AND_VERIFY);
     if (st != RPSW_OK) {
         goto fail;
     }
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_WRITE_OK);
 
-    uint8_t csr_readback = 0;
-
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_READ_START);
-    st = swim_link_read(SWIM_CSR_ADDR, &csr_readback, 1);
+    st = swim_link_release_reset_and_resync();
     if (st != RPSW_OK) {
-        swim_phy_set_swim_csr_debug(0, false);
         goto fail;
     }
 
-    swim_phy_set_swim_csr_debug(csr_readback, true);
-    swim_phy_set_enter_stage(SWIM_ENTER_STAGE_SWIM_CSR_READ_OK);
-
-    if ((csr_readback & SWIM_CSR_SWIM_DM) == 0u) {
-        st = RPSW_ERR_TARGET;
+    /*
+     * Do one post-stabilization DM access before reporting ENTER_SWIM as OK.
+     * Without this, the first external MEMORY_READ/MEMORY_WRITE sometimes becomes
+     * the sacrificial transaction and times out.
+     */
+    st = swim_link_handle_swim_csr(SWIM_CSR_VERIFY_ONLY);
+    if (st != RPSW_OK) {
         goto fail;
     }
 
-    swim_phy_nrst_release();
-    sleep_ms(1);
+    /*
+     * Make ENTER_SWIM complete only after the debug module accepts STALL.
+     * Otherwise the first host-side DM_CSR2 write becomes the sacrificial
+     * transaction and sometimes times out.
+     */
+    st = swim_link_stall_target();
+    if (st != RPSW_OK) {
+        goto fail;
+    }
 
     swim_phy_set_enter_stage(SWIM_ENTER_STAGE_DONE);
     return RPSW_OK;
@@ -192,6 +269,48 @@ fail:
     swim_phy_release();
     swim_phy_nrst_release();
     return st;
+}
+
+rpsw_status_t swim_link_set_speed(swim_speed_t speed) {
+	if (speed == SWIM_SPEED_LOW) {
+		return swim_phy_set_speed(SWIM_SPEED_LOW) ? RPSW_OK : RPSW_ERR_UNSUPPORTED;
+	}
+	if (speed != SWIM_SPEED_HIGH) {
+		return RPSW_ERR_BAD_ARGUMENT;
+	}
+
+	/*
+	 * UM0470: SWIM is activated in low-speed.  High-speed becomes valid only
+	 * after option-byte loading has finished, indicated by SWIM_CSR.HSIT.  Do
+	 * the SWIM_CSR write while the PHY is still low-speed; switch the local
+	 * encoder/decoder only after that write is ACKed.
+	 */
+	if (!swim_phy_set_speed(SWIM_SPEED_LOW)) {
+		return RPSW_ERR_UNSUPPORTED;
+	}
+
+	uint8_t csr = 0;
+	rpsw_status_t st = swim_link_read(SWIM_CSR_ADDR, &csr, 1u);
+	if (st != RPSW_OK) {
+		return st;
+	}
+	if ((csr & SWIM_CSR_HSIT) == 0u) {
+		swim_phy_set_swim_csr_debug(csr, true);
+		return RPSW_ERR_UNSUPPORTED;
+	}
+
+	uint8_t hs_csr = (uint8_t)((csr |
+                            SWIM_CSR_SAFE_MASK |
+                            SWIM_CSR_SWIM_DM |
+                            SWIM_CSR_HS) &
+                           (uint8_t)~SWIM_CSR_NO_ACCESS);
+	st = swim_link_write(SWIM_CSR_ADDR, &hs_csr, 1u);
+	if (st != RPSW_OK) {
+		return st;
+	}
+	sleep_us(20);
+	swim_phy_set_swim_csr_debug(hs_csr, true);
+	return swim_phy_set_speed(SWIM_SPEED_HIGH) ? RPSW_OK : RPSW_ERR_UNSUPPORTED;
 }
 
 rpsw_status_t swim_link_srst(void) {

@@ -55,9 +55,7 @@ static rpsw_status_t handle_frame(const rpsw_frame_t *request,
         if (request->length < 1 || request->payload[0] > SWIM_SPEED_HIGH) {
             return RPSW_ERR_BAD_ARGUMENT;
         }
-        return swim_phy_set_speed((swim_speed_t)request->payload[0])
-                   ? RPSW_OK
-                   : RPSW_ERR_UNSUPPORTED;
+        return swim_link_set_speed((swim_speed_t)request->payload[0]);
 
     case CMD_ENTER_SWIM:
         return swim_link_enter();

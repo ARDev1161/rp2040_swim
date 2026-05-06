@@ -23,8 +23,8 @@ rpsw_status_t stm8_dm_memory_read(uint32_t address, uint8_t *data, size_t len) {
     size_t done = 0;
     while (done < len) {
         size_t chunk = len - done;
-        if (chunk > 255u) {
-            chunk = 255u;
+        if (chunk > STM8_DM_READ_CHUNK_MAX) {
+            chunk = STM8_DM_READ_CHUNK_MAX;
         }
         rpsw_status_t st = swim_link_read(address + (uint32_t)done, data + done, chunk);
         if (st != RPSW_OK) {
@@ -39,8 +39,8 @@ rpsw_status_t stm8_dm_memory_write(uint32_t address, const uint8_t *data, size_t
     size_t done = 0;
     while (done < len) {
         size_t chunk = len - done;
-        if (chunk > 255u) {
-            chunk = 255u;
+        if (chunk > STM8_DM_WRITE_CHUNK_MAX) {
+            chunk = STM8_DM_WRITE_CHUNK_MAX;
         }
         rpsw_status_t st = swim_link_write(address + (uint32_t)done, data + done, chunk);
         if (st != RPSW_OK) {
